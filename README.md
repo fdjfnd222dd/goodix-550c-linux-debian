@@ -1,4 +1,32 @@
-# Goodix 27c6:550c Linux driver lab
+# Goodix 27c6:550c fingerprint reader on Linux — Debian 13 packages + `finger` TUI
+
+**Fingerprint login for the Lenovo Yoga 9 14IAP7 (Yoga 9i 2022, 82LU) on Linux.**
+If `lsusb` shows `27c6:550c Shenzhen Goodix Technology Co.,Ltd. FingerPrint` and fprintd says
+`No devices available`, this project is for you: a fail-closed libfprint driver, Debian 13
+`.deb` packages, fprintd/PAM setup for `sudo`, polkit and the KDE lock screen, and a friendly
+terminal app (`finger`) to enroll and test your fingers.
+
+![finger TUI home screen](docs/img/finger-home.png)
+
+| | |
+|---|---|
+| **Does my laptop work?** | Run `lsusb \| grep 27c6:550c`, then see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Yoga 9 14IAP7 ✅ · Yoga 9 14IRP8 ⚠️ (firmware 13022, testers wanted) |
+| **Install on Debian 13** | [docs/DEBIAN-INSTALL.md](docs/DEBIAN-INSTALL.md) — packages on the [Releases](../../releases) page |
+| **Something broke?** | [docs/RECOVERY.md](docs/RECOVERY.md) — one-line recovery and rollback to stock |
+| **How well does it work?** | [docs/measurements.md](docs/measurements.md) — ~85% first-touch match, 0 wrong-finger accepts, 0 sensor-start failures in 100+ opens |
+| **Important** | Unofficial and reverse-engineered. It never writes sensor firmware or keys. You need the **original Windows install** that paired your sensor to recover its key. Your password always keeps working. |
+
+Searching for an error? These all land here: `list_devices failed: No devices available`,
+`Impossible to enroll: GDBus.Error:net.reactivated.Fprint.Error.NoSuchDevice`,
+`USB error on device 27c6:550c: Invalid parameter [-2]`.
+
+This repository is a fork of [the-great-king-bart/goodix-550c-linux-driver](https://github.com/the-great-king-bart/goodix-550c-linux-driver),
+which did the original reverse engineering (Ubuntu TOD module, engineering record below). This fork adds
+Debian 13 packaging, driver reliability fixes (patches 0015–0019), the `goodix550c-ctl` tool and the `finger` TUI.
+
+---
+
+## Original project: Goodix 27c6:550c Linux driver lab
 
 The USB fingerprint reader in the Lenovo Yoga 9 14IAP7 enumerates as `27c6:550c`,
 and upstream `libfprint` lists it as unsupported: no driver binds to it. This
