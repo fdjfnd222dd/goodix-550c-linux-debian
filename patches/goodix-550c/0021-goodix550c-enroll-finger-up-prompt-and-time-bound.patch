@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fingerprint Lab <noreply@example.invalid>
+Date: Sat, 17 Oct 2026 20:00:00 +0200
+Subject: [PATCH] goodix550c: prompt for finger lift in enrollment and bound the finger-up wait in time
+
+Field failure 2026-10-17: after an enrollment stage the finger-up wait did not
+settle, the operator kept pressing (each touch restarts the consecutive-clear
+count, and nothing told them to lift), and 600 polls later the stage failed
+with a message that said nothing actionable.
+
+During enrollment, once the pad has not been confirmed clear for
+GOODIX_ENROLL_REMOVE_PROMPT_MS (1500), send FP_DEVICE_RETRY_REMOVE_FINGER
+through fpi_device_enroll_progress, once per wait, like the lifted-finger
+retries in the enroll state machine. The wait itself is unchanged.
+
+The wait now ends at whichever comes first: the existing 600-poll cap or
+GOODIX_FINGER_UP_MAX_MS (20000) of monotonic time, a fixed constant that is
+not a runtime tunable (a poll count alone scales with POLL_DELAY_MS). The
+failure message is plain English. No threshold, baseline or reference rule
+changes.
+---
+diff -ru a/drivers/goodix53x5/goodix53x5-private.h b/drivers/goodix53x5/goodix53x5-private.h
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -172,6 +172,14 @@
+  * reported anyway and the ordinary bounded finger-up wait continues. */
+ #define GOODIX_RESULT_FINGER_UP_WAIT_MS 1500
+ 
++/* The finger-up wait ends at the first of GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS
++ * polls or this much wall time; fixed on purpose, not a tunable. During
++ * enrollment the operator is asked once, after GOODIX_ENROLL_REMOVE_PROMPT_MS
++ * without the pad settling, to lift the finger: pressing again restarts the
++ * confirmation count and nothing else tells them to wait. */
++#define GOODIX_FINGER_UP_MAX_MS 20000
++#define GOODIX_ENROLL_REMOVE_PROMPT_MS 1500
++
+ /* Manual-FDT timing constants (moved here from goodix53x5-scan.c so the
+  * runtime tunable table below can name them). */
+ #define GOODIX_MANUAL_FDT_POLL_DELAY_MS 100
+diff -ru a/drivers/goodix53x5/goodix53x5-scan.c b/drivers/goodix53x5/goodix53x5-scan.c
+--- a/drivers/goodix53x5/goodix53x5-scan.c
++++ b/drivers/goodix53x5/goodix53x5-scan.c
+@@ -68,6 +68,8 @@
+   gboolean lift_rebasing;
+   guint rebase_polls;
+   guint rebase_stable;
++  /* Finger-up wait only: the remove-finger prompt has gone out for this wait. */
++  gboolean remove_prompted;
+ } GoodixManualFdtPollState;
+ 
+ /* Finger-wait SSM (awaiting finger down) */
+@@ -344,6 +346,26 @@
+   return TRUE;
+ }
+ 
++/* The finger-up wait is also bounded in wall time, so a poll count sized for
++ * one POLL_DELAY_MS cannot stretch it. Ends at whichever limit comes first.
++ * Returns TRUE when the SSM has been marked failed. */
++static gboolean
++goodix_manual_fdt_finger_up_expired (FpiSsm                   *ssm,
++                                     FpiDeviceGoodix53x5      *self,
++                                     GoodixManualFdtPollState *state)
++{
++  gint64 elapsed_ms = (g_get_monotonic_time () - self->up_wait_start_us) / 1000;
++
++  if (state->polls < GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS &&
++      elapsed_ms < GOODIX_FINGER_UP_MAX_MS)
++    return FALSE;
++
++  fpi_ssm_mark_failed (ssm,
++                       fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                 "Lift your finger and keep the sensor clear, then try again"));
++  return TRUE;
++}
++
+ static void
+ goodix_manual_fdt_log_poll (GoodixManualFdtPollState *state,
+                             const gchar              *phase,
+@@ -1430,11 +1452,24 @@
+             goodix_flush_pending_result_report (dev);
+           }
+ 
++        /* Enrollment only: tell fprintd once per wait to ask for the finger to
++         * be lifted, so the operator does not keep pressing and resetting the
++         * confirmation count. The wait itself is unchanged. */
++        if (!state->remove_prompted &&
++            fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
++            (g_get_monotonic_time () - self->up_wait_start_us) / 1000 >=
++            GOODIX_ENROLL_REMOVE_PROMPT_MS)
++          {
++            state->remove_prompted = TRUE;
++            fp_dbg ("Finger-up not confirmed after %dms; asking for the finger to be lifted",
++                    GOODIX_ENROLL_REMOVE_PROMPT_MS);
++            fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
++                                        fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
++          }
++
+         if (goodix_manual_fdt_check_cancelled (ssm, dev))
+           return;
+-        if (goodix_manual_fdt_budget_exhausted (ssm, state,
+-                                                GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS,
+-                                                "finger-up"))
++        if (goodix_manual_fdt_finger_up_expired (ssm, self, state))
+           return;
+         fpi_ssm_jump_to_state_delayed (ssm,
+                                        GOODIX_FINGER_UP_POLL_REQUEST,

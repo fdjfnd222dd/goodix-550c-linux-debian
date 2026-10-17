@@ -32,6 +32,7 @@ FINGER_PRESENT_PATCH = PATCH_DIR / "0017-goodix550c-refuse-finger-present-refere
 NON_CONTACT_GATE_PATCH = PATCH_DIR / "0018-goodix550c-verify-non-contact-gate.patch"
 TOUCH_DIRECTION_PATCH = PATCH_DIR / "0019-goodix550c-count-only-touch-direction-as-finger-down.patch"
 RUNTIME_TUNABLES_PATCH = PATCH_DIR / "0020-goodix550c-runtime-tunables.patch"
+FINGER_UP_PROMPT_PATCH = PATCH_DIR / "0021-goodix550c-enroll-finger-up-prompt-and-time-bound.patch"
 DRIVER_SERIES = PATCH_DIR / "driver-series"
 BUILD_SCRIPT = ROOT / "scripts" / "build_goodix550c_libfprint.sh"
 RUN_SCRIPT = ROOT / "scripts" / "run_goodix550c_open_close.sh"
@@ -381,6 +382,7 @@ def test_driver_patch_series_is_explicit_ordered_and_unique():
         NON_CONTACT_GATE_PATCH.name,
         TOUCH_DIRECTION_PATCH.name,
         RUNTIME_TUNABLES_PATCH.name,
+        FINGER_UP_PROMPT_PATCH.name,
     ]
     assert len(entries) == len(set(entries))
 
@@ -774,7 +776,7 @@ def test_finger_guard_patches_follow_the_open_recovery_patch():
         line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     ]
-    assert entries[-4:-2] == [FINGER_PRESENT_PATCH.name, NON_CONTACT_GATE_PATCH.name]
+    assert entries[-5:-3] == [FINGER_PRESENT_PATCH.name, NON_CONTACT_GATE_PATCH.name]
     assert entries.index(FINGER_PRESENT_PATCH.name) > entries.index(LOG_SUMMARY_PATCH.name)
 
 
@@ -1158,6 +1160,70 @@ def test_tunable_call_sites_replace_the_constants_without_changing_the_gate():
         assert use in added, use
     # Same comparison direction as before (strict >).
     assert "self->captured_clipped_fraction >\n            GOODIX_TUNE" in added
+
+
+# --- 0021: enrollment finger-up prompt + wall-time bound ---------------------
+
+def test_finger_up_prompt_patch_follows_the_tunables_patch():
+    entries = _series_entries()
+    assert entries.count(FINGER_UP_PROMPT_PATCH.name) == 1
+    assert entries.index(FINGER_UP_PROMPT_PATCH.name) == entries.index(RUNTIME_TUNABLES_PATCH.name) + 1
+
+
+def test_finger_up_wait_is_bounded_in_time_and_polls_and_not_tunable():
+    added = added_lines(FINGER_UP_PROMPT_PATCH)
+
+    assert int(_define(added, "GOODIX_FINGER_UP_MAX_MS")) == 20000
+    assert int(_define(added, "GOODIX_ENROLL_REMOVE_PROMPT_MS")) == 1500
+    # Both limits are checked; the 600-poll cap is kept, not replaced.
+    assert "state->polls < GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS" in added
+    assert "elapsed_ms < GOODIX_FINGER_UP_MAX_MS" in added
+    assert "goodix_manual_fdt_finger_up_expired (ssm, self, state)" in added
+    removed = _removed_lines(FINGER_UP_PROMPT_PATCH)
+    assert "GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS" not in removed.replace(
+        "GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS,", "")
+    # Fixed constants: nothing adds a tunable-table row or reads the environment.
+    assert "GOODIX_TUNE_TABLE" not in added
+    assert "getenv" not in added and "GOODIX_TUNE (self, FINGER_UP" not in added
+    # Wall time is measured on the monotonic clock from the wait's own start.
+    assert "g_get_monotonic_time () - self->up_wait_start_us" in added
+    # No new loop or sleep: the existing delayed poll carries the check.
+    for forbidden in ("g_usleep", "while (", "for (;;)", "g_main_context_iteration"):
+        assert forbidden not in added
+
+
+def test_finger_up_failure_message_is_plain_english():
+    added = added_lines(FINGER_UP_PROMPT_PATCH)
+
+    assert "Lift your finger and keep the sensor clear, then try again" in added
+    assert "FP_DEVICE_ERROR_PROTO" in added
+
+
+def test_remove_finger_prompt_is_enroll_only_and_sent_once_per_wait():
+    added = added_lines(FINGER_UP_PROMPT_PATCH)
+
+    assert "gboolean remove_prompted;" in added
+    prompt = added.split("if (!state->remove_prompted &&", 1)[1]
+    prompt = prompt.split("goodix_manual_fdt_check_cancelled", 1)[0]
+    assert "fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL" in prompt
+    assert "GOODIX_ENROLL_REMOVE_PROMPT_MS" in prompt
+    # The flag is set before the call, so a poll can never send it twice.
+    assert prompt.index("state->remove_prompted = TRUE") < prompt.index("fpi_device_enroll_progress")
+    assert "fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER)" in prompt
+    assert "self->enroll_stage, NULL" in prompt
+
+
+def test_finger_up_prompt_patch_leaves_safety_rules_alone():
+    patch = FINGER_UP_PROMPT_PATCH.read_text(encoding="utf-8")
+    added = added_lines(FINGER_UP_PROMPT_PATCH)
+
+    for forbidden in ("GOODIX_SIGFM_BEST_MIN", "refresh_baseline", "fdt_data_tx_on",
+                      "reference_image", "goodix_reference_frame", "psk", "0xA4", "0xE0"):
+        assert forbidden not in added, forbidden
+    # Baseline refresh, reference checks and the matcher are not in the diff at all.
+    assert "GOODIX_SIGFM_BEST_MIN" not in patch
+    # The summary line and its format are untouched.
+    assert "g_message" not in added
 
 
 # --- cross-component constants must not drift --------------------------------
