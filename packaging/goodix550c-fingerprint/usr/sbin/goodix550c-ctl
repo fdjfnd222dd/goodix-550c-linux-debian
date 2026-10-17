@@ -213,7 +213,8 @@ cmd_pam() {
         cp -a "$COMMON_AUTH" "$R/var/backups/goodix550c/common-auth.$(date +%Y%m%d%H%M%S)"
         sed -i '/pam_fprintd\.so/ s/max-tries=[0-9]*/max-tries=1/' "$COMMON_AUTH"
       fi
-      pam-auth-update --disable fprintd --enable "$PROFILE" ;;
+      # --force: the sandboxed run (WP2) showed the generated stack is correct once max-tries is normalized
+      pam-auth-update --force --disable fprintd --enable "$PROFILE" ;;
     disable) pam-auth-update --disable "$PROFILE" ;;
     *) die "usage: goodix550c-ctl pam enable|disable" ;;
   esac
