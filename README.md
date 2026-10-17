@@ -1,5 +1,7 @@
 # Goodix 27c6:550c fingerprint reader on Linux — Debian 13 packages + `finger` TUI
 
+[![tests](https://github.com/fdjfnd222dd/goodix-550c-linux-debian/actions/workflows/tests.yml/badge.svg)](https://github.com/fdjfnd222dd/goodix-550c-linux-debian/actions/workflows/tests.yml) [![release](https://img.shields.io/github/v/release/fdjfnd222dd/goodix-550c-linux-debian?label=release)](https://github.com/fdjfnd222dd/goodix-550c-linux-debian/releases/latest) ![Debian 13](https://img.shields.io/badge/Debian-13%20trixie-A81D33?logo=debian)
+
 **Fingerprint login for the Lenovo Yoga 9 14IAP7 (Yoga 9i 2022, 82LU) on Linux.**
 If `lsusb` shows `27c6:550c Shenzhen Goodix Technology Co.,Ltd. FingerPrint` and fprintd says
 `No devices available`, this project is for you: a fail-closed libfprint driver, Debian 13
