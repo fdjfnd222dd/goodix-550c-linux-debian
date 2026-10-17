@@ -125,8 +125,9 @@ class Scanner:
             self.add(where, "private-key-block")
         if EMAIL_RE.search(data):
             self.add(where, "personal-email-in-content")
+        hex_ok_here = bool(path) and self.path_allowed(path)
         for m in HEX64.finditer(data):
-            if m.group(0).lower() not in self.allow_hashes:
+            if not hex_ok_here and m.group(0).lower() not in self.allow_hashes:
                 self.add(where, "hex64-not-allowlisted")
 
     # -- targets -----------------------------------------------------------
