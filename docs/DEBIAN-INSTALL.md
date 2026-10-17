@@ -1,17 +1,14 @@
 # Installing on Debian 13 (trixie)
 
-Draft for other users. Read the disclaimers first.
+Packages: [latest release](https://github.com/fdjfnd222dd/goodix-550c-linux-debian/releases/latest). Read the disclaimers first.
 
-> **Release gate (maintainer, before any binary is published).** The 256-byte
-> `default_config` compiled into the driver is byte-identical to the one in the
-> Windows `Wbdi.dll` (see DOCUMENTATION.md, "Original Windows driver evidence").
-> Whether redistributing those bytes in a `.deb` is acceptable has not been decided.
-> The preferred fix is a new patch that loads the table from
-> `/etc/goodix550c/default_config.bin` at run time, installed by a
-> `goodix550c-ctl install-config <Wbdi.dll>` command from the user's own Windows
-> install, so no Windows-derived bytes ship. Until the maintainer resolves this (and
-> reviews the SIGFM/OpenCV licence terms), do not attach `.deb` files to a GitHub
-> Release. This note must be removed or updated when that is done.
+> **Provenance note.** The 256-byte `default_config` compiled into the driver is
+> byte-identical to the one in the Windows `Wbdi.dll` (see DOCUMENTATION.md, "Original
+> Windows driver evidence"); the same bytes are already public in the original project's
+> source patches. A planned change will load this table from the user's own Windows
+> install at setup time (`goodix550c-ctl install-config`) so the packages ship no
+> Windows-derived bytes. If you maintain a distribution, treat the current packages as
+> unsuitable for an official archive until that lands.
 
 ## Disclaimers
 
@@ -49,7 +46,7 @@ an issue, put it in a git repository or sync it to the cloud.
 
 1. Clone this repository (the extraction script only reads and writes inside it) and
    make the venv:
-   `git clone https://github.com/the-great-king-bart/goodix-550c-linux-driver && cd goodix-550c-linux-driver && python3 -m venv .venv && .venv/bin/pip install -e '.[dpapi]'`
+   `git clone https://github.com/fdjfnd222dd/goodix-550c-linux-debian && cd goodix-550c-linux-debian && python3 -m venv .venv && .venv/bin/pip install -e '.[dpapi]'`
 2. Mount the Windows system volume **read-only** at `.dpapi-windows-ro` inside the
    clone. The script refuses a mount that is not read-only. For example, with the
    Windows partition at `/dev/nvme0n1p3` (check with `lsblk -f`; if it is
