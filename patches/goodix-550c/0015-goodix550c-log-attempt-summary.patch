@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fingerprint Lab <noreply@example.invalid>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] goodix550c: log one integer-only summary line per open and per attempt
+
+Measuring whether a later change helps needs per-attempt numbers, and the only
+existing source of them is debug logging. Debug logging is not neutral: the
+matcher scores every enrolled sample instead of stopping at the first match
+whenever debug output is enabled, which changes the timing being measured.
+
+Add two summary lines emitted with g_message, so they reach the journal without
+G_MESSAGES_DEBUG and without touching the matcher's normal path:
+
+    goodix550c open: result=<ok|fail> ms=N phase=<claim|ping|fw|otp|tls|done>
+                     drain_bytes=0 tls_retry=0
+    goodix550c attempt: action=<verify|identify> ready_to_down_ms=N ...
+                     result=<match|no-match|retry:<reason>> dmax_pos=N dmax_neg=N
+
+The lines are gated by GOODIX550C_LOG_SUMMARY=1, read once when the device is
+opened. This patch only records values the existing flow already computes and
+prints them; no branch, wait, threshold or return value changes. The two signed
+delta figures are the largest positive and negative per-channel movement of the
+confirming finger-down poll against the no-finger baseline and are log-only.
+Every field is an integer; the only strings are fixed literals chosen from a
+table. No key, OTP, frame or template content is ever formatted.
+
+---
+
+--- a/drivers/goodix53x5/goodix53x5-auth.c
++++ b/drivers/goodix53x5/goodix53x5-auth.c
+@@ -58,6 +58,50 @@
+   return TRUE;
+ }
+ 
++static const gchar *
++goodix_summary_result_name (gint result)
++{
++  switch (result)
++    {
++    case GOODIX_SUMMARY_RESULT_MATCH: return "match";
++    case GOODIX_SUMMARY_RESULT_NO_MATCH: return "no-match";
++    case GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER: return "retry:remove-finger";
++    case GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID: return "retry:data-invalid";
++    default: return "retry:error";
++    }
++}
++
++/* One integer-only line per verify/identify attempt, gated by
++ * GOODIX550C_LOG_SUMMARY=1. g_message reaches the journal without
++ * G_MESSAGES_DEBUG. Reads state only; decides nothing. */
++static void
++goodix_log_attempt_summary (FpiDeviceGoodix53x5 *self,
++                            FpiDeviceAction      action)
++{
++  gint result = self->summary_result;
++  gint ready_to_down_ms = 0;
++
++  if (!self->log_summary)
++    return;
++
++  if (self->summary_ready_us != 0 && self->summary_down_us >= self->summary_ready_us)
++    ready_to_down_ms = (gint) ((self->summary_down_us - self->summary_ready_us) / 1000);
++
++  g_message ("goodix550c attempt: action=%s ready_to_down_ms=%d down_polls=%u "
++             "settle_ms=%d ref_mean=%d ref_retries=%u noncontact_x1000=%d "
++             "keypoints=%d best_score=%d early_exit=%d threshold=%d "
++             "result=%s dmax_pos=%d dmax_neg=%d",
++             action == FPI_DEVICE_ACTION_IDENTIFY ? "identify" : "verify",
++             ready_to_down_ms, self->summary_down_polls,
++             self->summary_settle_ms, self->summary_ref_mean,
++             self->summary_ref_retries,
++             self->summary_noncontact_x1000,
++             self->summary_keypoints, self->summary_best_score,
++             self->summary_early_exit ? 1 : 0, GOODIX_SIGFM_BEST_MIN,
++             goodix_summary_result_name (result),
++             self->summary_dmax_pos, self->summary_dmax_neg);
++}
++
+ /* Verify/Identify SSM */
+ typedef enum {
+   GOODIX_VERIFY_REINIT = 0,
+@@ -188,9 +232,13 @@
+         /* Extract SIFT features once for both identify and verify paths */
+         probe_info = goodix_match_extract (self->captured_image);
+         keypoints = goodix_match_keypoints_count (probe_info);
++        self->summary_keypoints = keypoints;
++        self->summary_noncontact_x1000 =
++          (gint) (self->captured_clipped_fraction * 1000.0 + 0.5);
+ 
+         if (keypoints < GOODIX_MIN_CAPTURE_KEYPOINTS)
+           {
++            self->summary_result = GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER;
+             if (action == FPI_DEVICE_ACTION_IDENTIFY)
+               {
+                 goodix_queue_identify_report (self, NULL,
+@@ -278,6 +326,7 @@
+                         if (stop_after_match &&
+                             tmpl_best_score >= GOODIX_SIGFM_BEST_MIN)
+                           {
++                            self->summary_early_exit = TRUE;
+                             g_variant_unref (child);
+                             break;
+                           }
+@@ -297,11 +346,19 @@
+                   }
+ 
+                 if (stop_after_match && match != NULL)
+-                  break;
++                  {
++                    self->summary_early_exit = TRUE;
++                    break;
++                  }
+               }
+ 
+             fp_dbg ("Identify best SIGFM score: %d (best_min: %d)",
+                     best_score, GOODIX_SIGFM_BEST_MIN);
++            self->summary_best_score = best_score;
++            self->summary_result = (valid_templates == 0 && saw_unusable_template) ?
++                                   GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID :
++                                   (match != NULL ? GOODIX_SUMMARY_RESULT_MATCH :
++                                    GOODIX_SUMMARY_RESULT_NO_MATCH);
+ 
+             if (valid_templates == 0 && saw_unusable_template)
+               {
+@@ -381,6 +438,7 @@
+                         if (!score_all_templates &&
+                             best_score >= GOODIX_SIGFM_BEST_MIN)
+                           {
++                            self->summary_early_exit = TRUE;
+                             g_variant_unref (child);
+                             break;
+                           }
+@@ -392,6 +450,12 @@
+ 
+             fp_dbg ("Verify best SIGFM score: %d (best_min: %d)",
+                     best_score, GOODIX_SIGFM_BEST_MIN);
++            self->summary_best_score = best_score;
++            self->summary_result = (valid_templates == 0 && saw_unusable_template) ?
++                                   GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID :
++                                   (best_score >= GOODIX_SIGFM_BEST_MIN ?
++                                    GOODIX_SUMMARY_RESULT_MATCH :
++                                    GOODIX_SUMMARY_RESULT_NO_MATCH);
+ 
+             if (valid_templates == 0 && saw_unusable_template)
+               {
+@@ -441,6 +505,8 @@
+   g_clear_pointer (&self->reference_image, g_free);
+   g_clear_pointer (&self->captured_image, g_free);
+ 
++  goodix_log_attempt_summary (self, action);
++
+   if (error)
+     {
+       /* If cleanup fails after matching, the auth result still matters more
+@@ -501,6 +567,21 @@
+   g_clear_pointer (&self->reference_image, g_free);
+   g_clear_pointer (&self->captured_image, g_free);
+ 
++  /* Log-only summary state for this attempt. */
++  self->summary_ready_us = 0;
++  self->summary_down_us = 0;
++  self->summary_down_polls = 0;
++  self->summary_settle_ms = 0;
++  self->summary_ref_mean = 0;
++  self->summary_ref_retries = 0;
++  self->summary_dmax_pos = 0;
++  self->summary_dmax_neg = 0;
++  self->summary_noncontact_x1000 = 0;
++  self->summary_keypoints = 0;
++  self->summary_best_score = 0;
++  self->summary_early_exit = FALSE;
++  self->summary_result = GOODIX_SUMMARY_RESULT_NONE;
++
+   ssm = fpi_ssm_new (dev, goodix_verify_ssm_handler,
+                       GOODIX_VERIFY_NUM_STATES);
+   self->task_ssm = ssm;
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -265,4 +265,44 @@
+   /* Monotonic time of the previously decoded frame, for the capture-path
+    * diagnostic only. Zero until the first frame of a session is decoded. */
+   gint64     last_frame_readout_us;
++
++  /* Log-only attempt/open summary state (GOODIX550C_LOG_SUMMARY=1). Nothing
++   * here is read by any decision; it only feeds the integer summary lines. */
++  gboolean   log_summary;
++  gint64     summary_open_start_us;
++  gint       summary_open_phase;
++  gint64     summary_ready_us;
++  gint64     summary_down_us;
++  guint      summary_down_polls;
++  gint       summary_settle_ms;
++  gint       summary_ref_mean;
++  guint      summary_ref_retries;
++  gint       summary_dmax_pos;
++  gint       summary_dmax_neg;
++  gint       summary_noncontact_x1000;
++  gint       summary_keypoints;
++  gint       summary_best_score;
++  gboolean   summary_early_exit;
++  gint       summary_result;
+ };
++
++/* Open phases reached, in order, for the open summary line. */
++typedef enum
++{
++  GOODIX_SUMMARY_PHASE_CLAIM = 0,
++  GOODIX_SUMMARY_PHASE_PING,
++  GOODIX_SUMMARY_PHASE_FW,
++  GOODIX_SUMMARY_PHASE_OTP,
++  GOODIX_SUMMARY_PHASE_TLS,
++  GOODIX_SUMMARY_PHASE_DONE,
++} GoodixSummaryPhase;
++
++/* Outcome of the matching step for the attempt summary line. */
++typedef enum
++{
++  GOODIX_SUMMARY_RESULT_NONE = 0,
++  GOODIX_SUMMARY_RESULT_MATCH,
++  GOODIX_SUMMARY_RESULT_NO_MATCH,
++  GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER,
++  GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID,
++} GoodixSummaryResult;
+--- a/drivers/goodix53x5/goodix53x5-scan.c
++++ b/drivers/goodix53x5/goodix53x5-scan.c
+@@ -590,6 +590,15 @@
+ 
+         goodix_550c_log_frame_stats (self, img12, "reference", self->calib.dac_l);
+ 
++        if (self->log_summary)
++          {
++            guint64 sum = 0;
++
++            for (int i = 0; i < GOODIX_SENSOR_PIXELS; i++)
++              sum += img12[i];
++            self->summary_ref_mean = (gint) (sum / GOODIX_SENSOR_PIXELS);
++          }
++
+         /* A reference frame carrying no signal must never be stored. It is
+          * subtracted from every subsequent capture, so an all-zero one silently
+          * turns the subtraction into a no-op and yields an image preprocessed
+@@ -605,6 +614,7 @@
+             if (self->reference_retries < GOODIX_REFERENCE_MAX_RETRIES)
+               {
+                 self->reference_retries++;
++                self->summary_ref_retries++;
+                 fp_dbg ("Reference frame carries no signal; retrying (%u/%u)",
+                         self->reference_retries, GOODIX_REFERENCE_MAX_RETRIES);
+                 fpi_ssm_jump_to_state_delayed (ssm, GOODIX_REF_CAPTURE_REG_ON,
+@@ -667,6 +677,8 @@
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+     case GOODIX_FINGER_WAIT_EC_POWER_ON:
++      if (self->summary_ready_us == 0)
++        self->summary_ready_us = g_get_monotonic_time ();
+       /* Power on sensor (idempotent if already on) */
+       fpi_device_report_finger_status_changes (dev,
+                                                FP_FINGER_STATUS_NEEDED,
+@@ -780,6 +792,7 @@
+           }
+ 
+         /* Real finger detected! */
++        self->summary_down_us = g_get_monotonic_time ();
+         fp_dbg ("Finger detected");
+         fpi_device_report_finger_status_changes (dev,
+                                                  FP_FINGER_STATUS_PRESENT,
+@@ -800,19 +813,43 @@
+         GoodixManualFdtPollState *state = fpi_ssm_get_data (ssm);
+         guint changed_pairs;
+         gboolean down;
++        const guint8 *down_reading = NULL;
+ 
+         if (goodix_manual_fdt_check_cancelled (ssm, dev))
+           return;
+         if (!goodix_manual_fdt_measure_reply (ssm, dev,
+                                               self->calib.delta_down,
+-                                              NULL,
++                                              &down_reading,
+                                               &changed_pairs))
+           return;
+ 
++        /* Log-only: signed per-channel delta against the no-finger baseline,
++         * overwritten each poll so the confirming poll's values remain. */
++        if (self->log_summary && down_reading != NULL)
++          {
++            gint pos = 0;
++            gint neg = 0;
++
++            for (gsize ch = 0; ch < GOODIX_FDT_BASE_LEN; ch += 2)
++              {
++                gint base = (self->fdt_data_tx_on[ch] |
++                             ((guint16) self->fdt_data_tx_on[ch + 1] << 8)) >> 1;
++                gint live = (down_reading[ch] |
++                             ((guint16) down_reading[ch + 1] << 8)) >> 1;
++
++                pos = MAX (pos, live - base);
++                neg = MIN (neg, live - base);
++              }
++            self->summary_dmax_pos = pos;
++            self->summary_dmax_neg = neg;
++          }
++
+         down = changed_pairs > 0;
+         goodix_manual_fdt_log_poll (state, "finger-down", down);
+         if (state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS)
+           {
++            self->summary_down_us = g_get_monotonic_time ();
++            self->summary_down_polls = state->polls;
+             fp_dbg ("Manual FDT finger-down confirmed after %u polls",
+                     state->polls);
+             fpi_device_report_finger_status_changes (dev,
+@@ -839,6 +876,9 @@
+        * the same outcome as withdrawing it a moment earlier. */
+       if (goodix_manual_fdt_check_cancelled (ssm, dev))
+         return;
++      if (self->summary_down_us != 0)
++        self->summary_settle_ms =
++          (gint) ((g_get_monotonic_time () - self->summary_down_us) / 1000);
+       fp_dbg ("Manual FDT contact settled for %dms; capturing",
+               GOODIX_MANUAL_FDT_DOWN_SETTLE_MS);
+       fpi_ssm_mark_completed (ssm);
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -264,6 +264,18 @@
+   FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+   GoodixOpenState state = fpi_ssm_get_cur_state (ssm);
+ 
++  /* Log-only: remember how far this open got, for the summary line. */
++  if (state <= GOODIX_OPEN_CLAIM_INTERFACE)
++    self->summary_open_phase = GOODIX_SUMMARY_PHASE_CLAIM;
++  else if (state == GOODIX_OPEN_PING)
++    self->summary_open_phase = GOODIX_SUMMARY_PHASE_PING;
++  else if (state <= GOODIX_OPEN_READ_CHIP_ID)
++    self->summary_open_phase = GOODIX_SUMMARY_PHASE_FW;
++  else if (state <= GOODIX_OPEN_PARSE_OTP)
++    self->summary_open_phase = GOODIX_SUMMARY_PHASE_OTP;
++  else
++    self->summary_open_phase = GOODIX_SUMMARY_PHASE_TLS;
++
+   switch (state)
+     {
+     case GOODIX_OPEN_USB_RESET:
+@@ -1407,12 +1419,43 @@
+              cleanup_error->message);
+ }
+ 
++static const gchar *
++goodix_summary_phase_name (gint phase)
++{
++  switch (phase)
++    {
++    case GOODIX_SUMMARY_PHASE_CLAIM: return "claim";
++    case GOODIX_SUMMARY_PHASE_PING: return "ping";
++    case GOODIX_SUMMARY_PHASE_FW: return "fw";
++    case GOODIX_SUMMARY_PHASE_OTP: return "otp";
++    case GOODIX_SUMMARY_PHASE_TLS: return "tls";
++    default: return "done";
++    }
++}
++
++/* One integer-only line per open. Gated by GOODIX550C_LOG_SUMMARY=1, read at
++ * open. g_message is used so it reaches the journal without G_MESSAGES_DEBUG. */
++static void
++goodix_log_open_summary (FpiDeviceGoodix53x5 *self,
++                         gboolean             ok)
++{
++  if (!self->log_summary)
++    return;
++
++  g_message ("goodix550c open: result=%s ms=%d phase=%s drain_bytes=0 tls_retry=0",
++             ok ? "ok" : "fail",
++             (int) ((g_get_monotonic_time () - self->summary_open_start_us) / 1000),
++             goodix_summary_phase_name (ok ? GOODIX_SUMMARY_PHASE_DONE :
++                                        self->summary_open_phase));
++}
++
+ static void
+ goodix_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ {
+   FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+ 
+   self->task_ssm = NULL;
++  goodix_log_open_summary (self, error == NULL);
+ 
+   /* The experimental polling path needs the two-sample-stable raw baseline
+    * for the duration of the open session. The default-off path retains the
+@@ -1443,6 +1486,9 @@
+ 
+   self->variant = (GoodixVariant) fpi_device_get_driver_data (dev);
+   self->tls_handshake_done = FALSE;
++  self->log_summary = g_strcmp0 (g_getenv ("GOODIX550C_LOG_SUMMARY"), "1") == 0;
++  self->summary_open_start_us = g_get_monotonic_time ();
++  self->summary_open_phase = GOODIX_SUMMARY_PHASE_CLAIM;
+ 
+   /* USB interface + bulk endpoints differ between the 53x5 and the 550c. */
+   if (self->variant == GOODIX_VARIANT_TLS_PSK)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,7 @@ REFERENCE_SIGNAL_PATCH = PATCH_DIR / "0011-goodix550c-refuse-empty-reference-fra
 RETRY_BUDGET_PATCH = PATCH_DIR / "0012-goodix550c-size-reference-retry-to-blackout.patch"
 KEEP_AWAKE_PATCH = PATCH_DIR / "0013-goodix550c-keep-sensor-awake-between-enroll-stages.patch"
 NO_ATEXIT_PATCH = PATCH_DIR / "0014-goodix550c-stop-openssl-installing-an-atexit-handler.patch"
+LOG_SUMMARY_PATCH = PATCH_DIR / "0015-goodix550c-log-attempt-summary.patch"
 DRIVER_SERIES = PATCH_DIR / "driver-series"
 BUILD_SCRIPT = ROOT / "scripts" / "build_goodix550c_libfprint.sh"
 RUN_SCRIPT = ROOT / "scripts" / "run_goodix550c_open_close.sh"
@@ -375,8 +377,88 @@ def test_driver_patch_series_is_explicit_ordered_and_unique():
         RETRY_BUDGET_PATCH.name,
         KEEP_AWAKE_PATCH.name,
         NO_ATEXIT_PATCH.name,
+        LOG_SUMMARY_PATCH.name,
     ]
     assert len(entries) == len(set(entries))
+
+
+def _summary_log_calls() -> list[str]:
+    """Every g_message (...) call the summary patch adds, as one string each."""
+    added = added_lines(LOG_SUMMARY_PATCH)
+    return [m.group(0) for m in re.finditer(r"g_message \(.*?\);", added, re.S)]
+
+
+def test_summary_logging_is_env_gated_and_read_once_at_open():
+    added = added_lines(LOG_SUMMARY_PATCH)
+
+    assert 'g_getenv ("GOODIX550C_LOG_SUMMARY")' in added
+    assert added.count('g_getenv ("GOODIX550C_LOG_SUMMARY")') == 1
+    assert "self->log_summary = " in added
+    # Both emitters bail out before formatting anything when the gate is off.
+    assert added.count("if (!self->log_summary)") == 2
+    assert "g_message" in added and "fp_info" not in added and "fp_dbg" not in added
+
+
+def test_summary_lines_carry_only_integers_and_fixed_literals():
+    calls = _summary_log_calls()
+    assert len(calls) == 2
+    attempt_call, open_call = sorted(calls, key=lambda c: "open:" in c)
+
+    assert "goodix550c open: result=%s ms=%d phase=%s drain_bytes=0 tls_retry=0" in open_call
+    assert "goodix550c attempt: action=%s" in attempt_call
+    for key in (
+        "ready_to_down_ms", "down_polls", "settle_ms", "ref_mean", "ref_retries",
+        "noncontact_x1000", "keypoints", "best_score", "early_exit", "threshold",
+        "result", "dmax_pos", "dmax_neg",
+    ):
+        assert f"{key}=%" in attempt_call
+
+    allowed_string_args = {
+        "ok ? \"ok\" : \"fail\"",
+        "goodix_summary_phase_name",
+        "goodix_summary_result_name",
+    }
+    for call in calls:
+        fmt = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', call[: call.index(",")]))
+        specs = re.findall(r"%[-+ #0]*\d*(?:\.\d+)?[a-zA-Z]", fmt)
+        assert specs, call
+        for spec in specs:
+            assert spec in ("%d", "%u", "%s"), (spec, call)
+        # %s is limited to the three keys that print a fixed literal.
+        assert fmt.count("%s") == len(re.findall(r"(?:action|result|phase)=%s", fmt)), call
+    assert "goodix_summary_phase_name" in open_call
+    assert "goodix_summary_result_name" in attempt_call
+    assert 'action == FPI_DEVICE_ACTION_IDENTIFY ? "identify" : "verify"' in attempt_call
+    assert "%p" not in "".join(calls) and "%x" not in "".join(calls)
+
+
+def test_summary_logging_does_not_touch_matching_or_leak_secrets():
+    added = added_lines(LOG_SUMMARY_PATCH)
+    calls = "\n".join(_summary_log_calls())
+
+    # No path into the exhaustive scoring mode, and no new control flow around it.
+    for forbidden in (
+        "goodix_match_scores_need_exhaustive_logging",
+        "score_all_templates",
+        "stop_after_match",
+        "g_log_writer_default_would_drop",
+    ):
+        assert forbidden not in added
+    assert "GOODIX_SIGFM_BEST_MIN" in calls  # the logged threshold, never a new one
+    assert "define GOODIX_SIGFM_BEST_MIN" not in added
+
+    # Nothing secret or bulky reaches a format argument.
+    for forbidden in (
+        "psk", "PSK", "otp", "fdt_event_data", "reference_image", "captured_image",
+        "img12", "img8", "feature", "tmpl", "template", "payload", "hex",
+        "->tls", "->rx", "reading", "base",
+    ):
+        assert forbidden not in calls, forbidden
+
+    # Logging only: it adds no return, goto, mark_failed or retry in the flow.
+    for forbidden in ("fpi_ssm_mark_failed", "fpi_device_retry_new", "goto ", "g_usleep"):
+        assert forbidden not in added
+    assert "fpi_ssm_jump_to_state" not in added
 
 
 def test_libfprint_patch_is_default_off_and_excludes_firmware_loader():
