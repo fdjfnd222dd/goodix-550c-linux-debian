@@ -75,3 +75,4 @@ UX: on retry say "shift your finger slightly" (retries currently miss 43%).
 | c4 + re-enroll | enrollment | 17 stages fresh | — | 40%* | 75% | 0 | kept (*too-short; fixed by 0019) |
 | c5 (0019) | touch direction | ±20 | 85% | 80% | — | 0 | kept |
 | c6 (0020, defaults) | — (timing instrumented) | — | 100% (12) | — | — | 0 (max 0) | kept. down→result 411 ms = settle 300 + capture ~100 + match 5; ready→match 1267 ms incl. reaction |
+| r1 | SETTLE_MS / POLL_DELAY_MS | 300→150 / 100→60 | 92% (12; 1 miss score 6 = coverage, noncontact 0) | — | — | 0 (max 1) | provisional keep: down→result 411→258 ms, detection −80 ms; scores median 531→6598 |

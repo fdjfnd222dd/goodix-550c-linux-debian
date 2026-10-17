@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Coached enrollment: one short placement instruction per stage so the stored
+# samples cover the whole finger (centre, tip, base, both edges, corners).
+#
+#   goodix550c_enroll_coached.sh [slot]     (default slot: right-middle-finger)
+#
+# A second slot for the SAME physical finger adds coverage without touching the
+# existing enrollment. fprintd asks for your password (polkit) before it starts.
+set -uo pipefail
+
+SLOT="${1:-right-middle-finger}"
+TIMEOUT="${ENROLL_TIMEOUT:-240}"
+PLACES=(middle middle "fingertip" "fingertip" "lower part of finger" "lower part of finger"
+        "roll LEFT" "roll LEFT" "roll RIGHT" "roll RIGHT" "tip, roll left" "tip, roll right" "low, roll left" "low, roll right"
+        middle middle middle middle middle middle middle middle middle middle middle middle middle middle)
+
+BOLD="$(tput bold 2>/dev/null || true)"; NORM="$(tput sgr0 2>/dev/null || true)"
+say() { printf '%s%s%s\n' "$BOLD" "$1" "$NORM"; }
+
+if fprintd-list "$USER" 2>/dev/null | grep -q -- "- #[0-9]*: $SLOT\$"; then
+    echo "$SLOT is already enrolled. Delete it first: fprintd-delete -f $SLOT $USER" >&2
+    exit 1
+fi
+
+say "=== Enroll RIGHT INDEX into slot '$SLOT' ==="
+echo "    Each time it says TOUCH NOW, put the finger where it says, hold ~1 sec, lift."
+stage=0 result=fail
+while IFS= read -r line; do
+    case "$line" in
+        *"Enrolling"*) say "[1] TOUCH NOW: ${PLACES[0]}" ;;
+        *"enroll-stage-passed"*)
+            stage=$((stage + 1))
+            say "[$((stage + 1))] TOUCH NOW: ${PLACES[stage]:-middle}" ;;
+        *"enroll-completed"*) result=ok ;;
+        *"enroll-retry-scan"*|*"enroll-swipe-too-short"*|*"enroll-finger-not-centered"*|*"enroll-remove-and-retry"*)
+            say "    didn't take. Lift, TOUCH NOW again: ${PLACES[stage]:-middle}" ;;
+        *"enroll-duplicate"*) say "    (already stored that spot) TOUCH NOW again" ;;
+        *"enroll-failed"*|*"enroll-unknown-error"*|*"enroll-data-full"*|*"failed"*|*"Error"*|*"error"*) echo "   $line" ;;
+    esac
+done < <(timeout "$TIMEOUT" stdbuf -oL -eL fprintd-enroll -f "$SLOT" "$USER" 2>&1)
+
+if [[ "$result" == ok ]]; then
+    say "DONE - '$SLOT' enrolled. Tell Claude 'done'."
+else
+    say "Enrollment did not finish. Tell Claude."
+    exit 1
+fi
