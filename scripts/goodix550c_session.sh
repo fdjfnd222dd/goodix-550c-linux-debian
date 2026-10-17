@@ -31,43 +31,85 @@ next_run() {
 marker_start() { logger -t "$TAG" "label=$1 finger=$2 run=$RUN_ID"; }
 marker_end() { logger -t "$TAG" "end run=$RUN_ID${1:+ result=$1}"; }
 
+BOLD="$(tput bold 2>/dev/null || true)"; NORM="$(tput sgr0 2>/dev/null || true)"
+say() { printf '%s%s%s\n' "$BOLD" "$1" "$NORM"; }
+
 ask() {
     # ask "prompt" ; returns when the human presses Enter
     local reply
     read -r -p "$1 " reply || exit 1
 }
 
+# Streams fprintd-verify so the human sees TOUCH NOW the moment the sensor is ready.
+# Sets RESULT to match|no-match|timeout|other.
 verify_once() {
-    local out rc
-    out="$(timeout "$VERIFY_TIMEOUT" fprintd-verify -f any "$USER" 2>&1)"
-    rc=$?
-    printf '   -> %s\n' "$(printf '%s\n' "$out" | grep -E 'Verify result' | tail -1 | sed 's/^ *//')"
-    ((rc == 124)) && echo "   -> timed out after ${VERIFY_TIMEOUT}s"
-    return 0
+    local line
+    RESULT=other
+    while IFS= read -r line; do
+        case "$line" in
+            *"Verify started"*) say "   >>> TOUCH THE SENSOR NOW (rest flat ~1 sec, then lift) <<<" ;;
+            *"Verify result:"*"(not done)"*) say "   ...didn't read it. Lift, then TOUCH AGAIN." ;;
+            *"verify-match"*) RESULT=match ;;
+            *"verify-no-match"*) RESULT=no-match ;;
+        esac
+    done < <(timeout "$VERIFY_TIMEOUT" stdbuf -oL -eL fprintd-verify -f any "$USER" 2>&1; echo "rc=$?")
+    case "$RESULT" in
+        match) say "   MATCH" ;;
+        no-match) say "   NO MATCH" ;;
+        *) say "   (no result - timed out)"; RESULT=timeout ;;
+    esac
 }
 
+pause_next() { echo "   lift your finger... next one in 2 sec"; sleep 2; }
+
 touch_block() {
-    # touch_block <label> <finger> <count> <prompt>
-    local label="$1" finger="$2" count="$3" prompt="$4" i
+    # touch_block <label> <finger> <count> <instruction>
+    local label="$1" finger="$2" count="$3" instr="$4" i
     mark_start_time
-    echo "== $label x$count =="
+    echo
+    say "=== $instr ==="
+    echo "    ($count times. No Enter needed. Ctrl+C to stop.)"
+    sleep 3
     for ((i = 1; i <= count; i++)); do
-        ask "[$i/$count] $prompt Press Enter:"
+        echo
+        echo "[$i/$count]"
         next_run "$label"
         marker_start "$label" "$finger"
-        echo "   Touch when it says 'Place your finger'."
         verify_once
         marker_end
+        ((i < count)) && pause_next
     done
 }
 
-b1() { touch_block genuine "$FINGER" 20 "Lift your finger fully. Then Enter, and touch ($FINGER) after the prompt."; }
-b2() { touch_block present-at-start "$FINGER" 10 "Rest your finger ($FINGER) on the pad NOW and keep it there, then"; }
-b3() { touch_block impostor "$IMPOSTOR_FINGER" 10 "Use $IMPOSTOR_FINGER (not enrolled). Lift first, then"; }
+b1() { touch_block genuine "$FINGER" 20 "Use your RIGHT INDEX finger. Touch only when it says TOUCH NOW"; }
+
+b2() {
+    # finger already resting on the pad when the action starts
+    local label=present-at-start count=8 i
+    mark_start_time
+    echo
+    say "=== Finger-already-on-the-pad test (RIGHT INDEX) ==="
+    echo "    Each round: put your finger ON the sensor and LEAVE it there."
+    echo "    After 3 sec it says LIFT. Lift, then touch again when it says TOUCH NOW."
+    for ((i = 1; i <= count; i++)); do
+        echo
+        say "[$i/$count] PUT YOUR FINGER ON THE SENSOR NOW and keep it there"
+        sleep 3
+        next_run "$label"
+        marker_start "$label" "$FINGER"
+        ( sleep 3; say "   >>> LIFT your finger now <<<" ) &
+        verify_once
+        wait
+        marker_end
+        ((i < count)) && pause_next
+    done
+}
+
+b3() { touch_block impostor "$IMPOSTOR_FINGER" 8 "Use your LEFT INDEX finger (wrong finger on purpose). Touch when it says TOUCH NOW"; }
 
 b4() {
     mark_start_time
-    echo "== opens x50 (do NOT touch the sensor; ~4 min) =="
+    echo; say "=== HANDS OFF: do NOT touch the sensor for ~4 min (go grab a drink) ==="
     next_run opens
     marker_start opens none
     local i
@@ -81,10 +123,10 @@ b4() {
 
 b5() {
     mark_start_time
-    echo "== sudo x10 (touch when it waits, or type the password) =="
+    echo; say "=== sudo test: when sudo says 'Place your finger', touch the sensor ==="; echo "    (10 times, no Enter needed)"
     local i t0 t1
     for ((i = 1; i <= 10; i++)); do
-        ask "[$i/10] Lift your finger. Enter, then touch when sudo waits:"
+        echo; echo "[$i/10]"
         next_run sudo
         marker_start sudo "$FINGER"
         t0=$(date +%s.%N)
@@ -92,6 +134,7 @@ b5() {
         t1=$(date +%s.%N)
         printf '   -> sudo finished in %.1fs\n' "$(echo "$t1 - $t0" | bc)"
         marker_end
+        ((i < 10)) && pause_next
     done
 }
 
@@ -136,6 +179,7 @@ case "${1:-}" in
     b5) b5 ;;
     b6) b6 ;;
     all) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; report "${2:-all}" ;;
+    baseline|test) rm -f "$START_FILE"; b1; b2; b3; b4; b5; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-${1}}" ;;
     report) report "${2:-session}" ;;
     *)
         echo "Usage: $0 b1|b2|b3|b4|b5|b6|all|report [name]" >&2
