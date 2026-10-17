@@ -211,6 +211,12 @@ report() {
     journalctl --no-pager -o short-iso --since "$since" _SYSTEMD_UNIT=fprintd.service + SYSLOG_IDENTIFIER="$TAG" > "$log"
     "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log"
     "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log" --json > "$json" && echo "JSON saved: $json"
+    # BASELINE=<json> (default: the c5 genuine baseline) prints a side-by-side delta table.
+    local baseline="${BASELINE:-$OUT_DIR/2026-10-17-c5-b1.json}"
+    if [[ -s "$baseline" && "$baseline" != "$json" ]]; then
+        echo; echo "vs $(basename "$baseline"):"
+        "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log" --compare "$baseline"
+    fi
 }
 
 # run_set fresh|keep REPORT_NAME BLOCK... : run blocks in order, then report.
