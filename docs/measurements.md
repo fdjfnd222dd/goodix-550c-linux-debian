@@ -105,7 +105,9 @@ before re-enrolling and not worse than baseline; B3 0 accepts.
 | c2 | `1.94.10+goodix550c2` | through 0015 (summary logging, no behaviour change) | baseline |
 | c3 | `1.94.10+goodix550c3` | adds 0016 (drain, PSK-hash check, one TLS retry) | stale-TLS fix |
 | c4 | `1.94.10+goodix550c4` | 0015–0018 | stale-TLS fix + capture guards |
-| c5 | `1.94.10+goodix550c5` | 0015–0019 | touch-direction finger-down (release build) |
+| c5 | `1.94.10+goodix550c5` | 0015–0019 | touch-direction finger-down (release debian13-v1.0.x) |
+| c6 | `1.94.10+goodix550c6` | 0015–0020 | runtime tunables + timing fields (defaults = c5) |
+| c7 | `1.94.10+goodix550c7` | 0015–0021 | enroll lift prompt + 20 s finger-up bound (release debian13-v1.1.0, with goodix550c-fingerprint 1.1.4 tuned drop-in) |
 
 ## Results (2026-10-17, one person, one Yoga 9 14IAP7)
 
