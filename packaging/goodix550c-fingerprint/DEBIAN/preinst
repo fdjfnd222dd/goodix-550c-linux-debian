@@ -1,0 +1,33 @@
+#!/bin/sh
+# Fresh install only: move unowned legacy hand-made files out of the way so the
+# packaged copies take over without dpkg conffile prompts.
+set -e
+case "$1" in
+install)
+    BK=/var/backups/goodix550c-legacy
+    moved=0
+    for p in \
+        /etc/systemd/system/fprintd.service.d/10-goodix550c.conf \
+        /etc/systemd/system/fprintd.service.d/20-goodix550c-unstick.conf \
+        /etc/systemd/system/fprintd.service.d/40-goodix550c-stats.conf \
+        /usr/local/sbin/goodix550c-unstick \
+        /usr/lib/systemd/system-sleep/goodix550c \
+        /opt/goodix550c-probe \
+        /etc/tlp.d/50-goodix550c.conf
+    do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+        if dpkg-query -S "$p" >/dev/null 2>&1; then
+            continue
+        fi
+        if [ "$moved" = 0 ]; then
+            install -d -m 0700 "$BK"
+            moved=1
+        fi
+        dest="$BK/$(echo "${p#/}" | tr / _)"
+        [ ! -e "$dest" ] || dest="$dest.$(date +%Y%m%d%H%M%S)"
+        mv "$p" "$dest"
+        echo "goodix550c-fingerprint: moved legacy $p -> $dest"
+    done
+    ;;
+esac
+exit 0

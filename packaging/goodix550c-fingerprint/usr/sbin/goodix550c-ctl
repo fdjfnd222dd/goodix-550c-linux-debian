@@ -1,0 +1,291 @@
+#!/bin/bash
+# goodix550c-ctl - status, recovery and maintenance helper for the Goodix 27c6:550c fingerprint setup.
+# GOODIX550C_ROOT=<dir> prefixes filesystem paths (for tests); it also skips the root check.
+set -euo pipefail
+
+R="${GOODIX550C_ROOT:-}"
+LIBPKG=libfprint-2-2
+PKG=goodix550c-fingerprint
+PROFILE=goodix550c-fingerprint
+PSK_DIR="$R/etc/goodix550c"
+PSK="$PSK_DIR/goodix550c.psk"
+STORE="$R/var/lib/fprint"
+DROPIN="$R/usr/lib/systemd/system/fprintd.service.d/50-goodix550c.conf"
+UDEV_RULE="$R/usr/lib/udev/rules.d/60-goodix550c-power.rules"
+TLP_CONF="$R/etc/tlp.d/50-goodix550c.conf"
+PIN_CONF="$R/etc/apt/preferences.d/goodix550c-libfprint"
+PAM_PROFILE="$R/usr/share/pam-configs/$PROFILE"
+COMMON_AUTH="$R/etc/pam.d/common-auth"
+DEBS="${GOODIX550C_DEBS:-$HOME/goodix550c-debs}"
+VENDOR=27c6
+PRODUCT=550c
+
+RECOVERY_LINE='sudo apt install ~/goodix550c-debs/patched/libfprint-2-2_<latest>.deb ~/goodix550c-debs/patched/goodix550c-fingerprint_<latest>_all.deb && sudo apt-mark hold libfprint-2-2 && sudo goodix550c-ctl recover'
+
+usage() {
+  cat <<'USAGE'
+Usage: goodix550c-ctl <command> [args]
+
+  status                 show package, hold, pin, drop-in, USB power, PSK, store, PAM, recent log (non-root OK)
+  doctor                 pass/fail checklist (exit 1 if anything failed)
+  recover                restart fprintd, re-trigger udev, re-apply hold, harden store, show status   (root)
+  enroll <finger>        enroll a finger for the invoking user, e.g. right-index-finger
+  install-psk <file>     install a PSK (32 raw bytes or 64 hex chars) as /etc/goodix550c/goodix550c.psk   (root)
+  psk-backup <dest>      copy the installed PSK to <dest> (0600); refuses repo and /tmp paths   (root)
+  harden-store           chmod -R go-rwx /var/lib/fprint   (root)
+  pam enable|disable     enable/disable the pam-auth-update profile   (root)
+  rollback-stock         back to stock libfprint-2-2 (keeps prints and PSK)   (root)
+  -h, --help             this help
+USAGE
+}
+
+die() { echo "goodix550c-ctl: $*" >&2; exit 1; }
+
+need_root() {
+  [ -n "$R" ] || [ "$(id -u)" -eq 0 ] || die "'$1' needs root; run: sudo goodix550c-ctl $1"
+}
+
+pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true; }
+
+lib_is_goodix() {
+  case "$(pkg_version "$LIBPKG")" in *+goodix550c*) return 0 ;; *) return 1 ;; esac
+}
+
+is_held() { apt-mark showhold 2>/dev/null | grep -x "$LIBPKG" >/dev/null; }
+
+pam_profile_enabled() { [ -r "$COMMON_AUTH" ] && grep -q 'pam_fprintd.so' "$COMMON_AUTH" && grep -q 'pam_succeed_if.so.*service in .*kde' "$COMMON_AUTH"; }
+
+usb_power_state() {
+  # prints "<devpath>=<control>" per matching device
+  local d v p
+  for d in "$R"/sys/bus/usb/devices/*; do
+    [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ] || continue
+    v="$(cat "$d/idVendor")"; p="$(cat "$d/idProduct")"
+    [ "$v" = "$VENDOR" ] && [ "$p" = "$PRODUCT" ] || continue
+    echo "$(basename "$d")=$(cat "$d/power/control" 2>/dev/null || echo '?')"
+  done
+}
+
+device_present() {
+  if [ -n "$R" ]; then [ -n "$(usb_power_state)" ]; return; fi
+  command -v lsusb >/dev/null 2>&1 && lsusb -d "$VENDOR:$PRODUCT" >/dev/null 2>&1
+}
+
+fprintd_env() { systemctl show fprintd -p Environment 2>/dev/null | sed 's/^Environment=//' || true; }
+
+psk_mode() { stat -c '%a %U' "$PSK" 2>/dev/null || true; }
+
+store_bad_perms() {
+  [ -d "$STORE" ] && [ -r "$STORE" ] || return 0
+  find "$STORE" \( -type d -o -type f \) -perm /077 2>/dev/null | head -n 1 || true
+}
+
+cmd_status() {
+  local v pv
+  echo "== goodix550c status"
+  v="$(pkg_version "$LIBPKG")"; echo "libfprint-2-2 version: ${v:-not installed}"
+  if lib_is_goodix; then echo "  patched goodix550c build: yes"; else echo "  patched goodix550c build: NO (stock library; sensor unsupported)"; fi
+  if is_held; then echo "  hold: yes"; else echo "  hold: NO  (fix: sudo apt-mark hold $LIBPKG)"; fi
+  if [ -f "$PIN_CONF" ]; then echo "  apt pin: present"; else echo "  apt pin: MISSING ($PIN_CONF)"; fi
+  pv="$(dpkg-query -W -f='${Provides}' "$LIBPKG" 2>/dev/null | tr ',' '\n' | sed 's/^ *//' | grep '^libfprint-goodix550c' || true)"
+  echo "  provides: ${pv:-none}"
+  pv="$(pkg_version "$PKG")"; echo "$PKG: ${pv:-not installed}"
+  echo "fprintd environment: $(fprintd_env)"
+  echo "drop-ins:"
+  local f
+  for f in "$DROPIN" "$UDEV_RULE" "$TLP_CONF" "$PIN_CONF" "$PAM_PROFILE"; do
+    if [ -e "$f" ]; then echo "  present  ${f#"$R"}"; else echo "  MISSING  ${f#"$R"}"; fi
+  done
+  local legacy
+  legacy="$(ls "$R"/etc/systemd/system/fprintd.service.d/*goodix550c* 2>/dev/null || true)"
+  [ -z "$legacy" ] || echo "  WARNING legacy local drop-ins still present: $legacy"
+  local up; up="$(usb_power_state)"
+  if [ -n "$up" ]; then echo "USB power/control: $(echo "$up" | tr '\n' ' ')"; else echo "USB power/control: device not found"; fi
+  if [ "$(id -u)" -eq 0 ] || [ -n "$R" ]; then
+    if [ -f "$PSK" ]; then echo "PSK: present, mode+owner: $(psk_mode)"; else echo "PSK: MISSING (goodix550c-ctl install-psk FILE)"; fi
+  else
+    echo "PSK: not checked (needs root)"
+  fi
+  local bad; bad="$(store_bad_perms)"
+  if [ ! -d "$STORE" ]; then echo "print store: $STORE absent or unreadable"
+  elif [ ! -r "$STORE" ]; then echo "print store: not readable by this user (good; run as root to check)"
+  elif [ -n "$bad" ]; then echo "print store: group/other-accessible entries present (fix: sudo goodix550c-ctl harden-store)"
+  else echo "print store: ok (no group/other access)"; fi
+  if pam_profile_enabled; then echo "PAM profile: enabled in common-auth"; else echo "PAM profile: NOT enabled (sudo goodix550c-ctl pam enable)"; fi
+  echo "recent driver log:"
+  local lg
+  lg="$(journalctl -u fprintd -b --no-pager -o cat 2>/dev/null | grep -E 'goodix550c (open|attempt):' | tail -n 10 || true)"
+  if [ -n "$lg" ]; then echo "$lg" | sed 's/^/  /'; else echo "  (none readable)"; fi
+  echo "recovery one-liner:"
+  echo "  $RECOVERY_LINE"
+}
+
+cmd_harden() {
+  need_root harden-store
+  if [ -d "$STORE" ]; then chmod -R go-rwx "$STORE"; echo "hardened $STORE"; else echo "no $STORE yet"; fi
+}
+
+cmd_recover() {
+  need_root recover
+  systemctl daemon-reload || true
+  udevadm control --reload || true
+  udevadm trigger --action=add --attr-match=idVendor=$VENDOR --attr-match=idProduct=$PRODUCT || true
+  systemctl restart fprintd || true
+  apt-mark hold "$LIBPKG" || true
+  cmd_harden
+  cmd_status
+}
+
+VALID_FINGERS="left-thumb left-index-finger left-middle-finger left-ring-finger left-little-finger right-thumb right-index-finger right-middle-finger right-ring-finger right-little-finger"
+
+cmd_enroll() {
+  [ $# -eq 1 ] || die "usage: goodix550c-ctl enroll <finger>   (one of: $VALID_FINGERS)"
+  local finger="$1" ok=0 f user
+  for f in $VALID_FINGERS; do [ "$f" = "$finger" ] && ok=1; done
+  [ "$ok" = 1 ] || die "unknown finger '$finger'; use one of: $VALID_FINGERS"
+  user="${SUDO_USER:-${USER:-$(id -un)}}"
+  # The finger goes in -f; a positional argument would be taken as the username.
+  exec fprintd-enroll -f "$finger" "$user"
+}
+
+TMP_PSK=""
+cmd_install_psk() {
+  need_root install-psk
+  [ $# -eq 1 ] || die "usage: goodix550c-ctl install-psk <file>"
+  local src="$1" size
+  [ -f "$src" ] && [ -r "$src" ] || die "not a readable file: $src"
+  size="$(stat -c %s "$src")"
+  TMP_PSK="$(mktemp)"; local tmp="$TMP_PSK"
+  trap 'rm -f "$TMP_PSK"' EXIT
+  chmod 600 "$tmp"
+  if [ "$size" -eq 32 ]; then
+    # driver wants hex text; convert raw bytes without printing them
+    od -An -v -tx1 "$src" | tr -d ' \n' > "$tmp"
+  elif [ "$size" -eq 64 ] || [ "$size" -eq 65 ]; then
+    tr -d '\n' < "$src" > "$tmp"
+    grep -Eq '^[0-9a-fA-F]{64}$' "$tmp" || die "not 64 hex characters"
+    # driver accepts a trailing newline; keep file canonical (hex + newline)
+  else
+    die "PSK must be 32 raw bytes or 64 hex characters (got $size bytes)"
+  fi
+  [ "$(tr -d '\n' < "$tmp" | wc -c)" -eq 64 ] || die "conversion failed"
+  if [ -n "$R" ]; then
+    install -d -m 0700 "$PSK_DIR"
+    install -m 0600 "$tmp" "$PSK"
+  else
+    install -d -m 0700 -o root -g root "$PSK_DIR"
+    install -o root -g root -m 0600 "$tmp" "$PSK"
+  fi
+  echo installed
+}
+
+cmd_psk_backup() {
+  need_root psk-backup
+  [ $# -eq 1 ] || die "usage: goodix550c-ctl psk-backup <dest>"
+  umask 077
+  local dest d
+  dest="$(realpath -m -- "$1")"
+  [ -f "$PSK" ] || die "no PSK installed at ${PSK#"$R"}"
+  [ ! -e "$dest" ] || die "refusing to overwrite $dest"
+  case "$dest" in
+    /tmp|/tmp/*|/var/tmp|/var/tmp/*|/dev/shm|/dev/shm/*)
+      [ -n "${GOODIX550C_TEST_ALLOW_TMP:-}" ] || die "refusing to put the PSK under a temporary directory" ;;
+  esac
+  d="$(dirname "$dest")"
+  while [ "$d" != / ]; do
+    [ ! -e "$d/.git" ] || die "refusing to put the PSK inside a git repository ($d)"
+    d="$(dirname "$d")"
+  done
+  [ -d "$(dirname "$dest")" ] || die "destination directory does not exist"
+  cp -- "$PSK" "$dest"
+  chmod 600 "$dest"
+  [ -z "${SUDO_UID:-}" ] || chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$dest" 2>/dev/null || true
+  echo "backed up to $dest (mode 0600; keep it off-repo and off-cloud)"
+}
+
+cmd_pam() {
+  need_root pam
+  case "${1:-}" in
+    enable)
+      if [ -f "$COMMON_AUTH" ] && grep -q 'pam_fprintd.so.*max-tries=' "$COMMON_AUTH"; then
+        # pam-auth-update would carry a hand-edited max-tries into the generated line
+        mkdir -p "$R/var/backups/goodix550c"
+        cp -a "$COMMON_AUTH" "$R/var/backups/goodix550c/common-auth.$(date +%Y%m%d%H%M%S)"
+        sed -i '/pam_fprintd\.so/ s/max-tries=[0-9]*/max-tries=1/' "$COMMON_AUTH"
+      fi
+      pam-auth-update --disable fprintd --enable "$PROFILE" ;;
+    disable) pam-auth-update --disable "$PROFILE" ;;
+    *) die "usage: goodix550c-ctl pam enable|disable" ;;
+  esac
+}
+
+cmd_rollback() {
+  need_root rollback-stock
+  local deb
+  deb="$(ls "$DEBS"/stock/libfprint-2-2_*.deb 2>/dev/null | head -n 1 || true)"
+  [ -n "$deb" ] || die "no stock deb in $DEBS/stock"
+  pam-auth-update --disable "$PROFILE" || true
+  apt-mark unhold "$LIBPKG" || true
+  # removing the package also removes the pin conffile
+  apt-get remove -y "$PKG"
+  apt-get install -y --allow-downgrades "$deb"
+  echo "stock libfprint restored; prints (/var/lib/fprint) and PSK (/etc/goodix550c) kept."
+  echo "reinstall: $RECOVERY_LINE"
+}
+
+usb_power_on() { local u; u="$(usb_power_state)"; [ -n "$u" ] && ! echo "$u" | grep -v '=on$' >/dev/null; }
+psk_ok() { [ "$(stat -c %a "$PSK")" = 600 ]; }
+store_ok() { [ -z "$(store_bad_perms)" ]; }
+
+PASS=0; FAIL=0
+check() { # name, command...
+  local name="$1"; shift
+  if "$@" >/dev/null 2>&1; then echo "PASS  $name"; PASS=$((PASS+1)); else echo "FAIL  $name"; FAIL=$((FAIL+1)); fi
+}
+
+env_effective() {
+  local e; e="$(fprintd_env)"
+  case "$e" in *FP_DRIVERS_ALLOWLIST=goodix53x5*GOODIX550C_PSK_FILE=* | *GOODIX550C_PSK_FILE=*FP_DRIVERS_ALLOWLIST=goodix53x5*) ;; *) return 1 ;; esac
+  case "$e" in *GOODIX550C_ALLOW_VOLATILE_INIT=1*) ;; *) return 1 ;; esac
+}
+
+cmd_doctor() {
+  check "sensor $VENDOR:$PRODUCT visible on USB" device_present
+  local fw
+  fw="$(journalctl -u fprintd -b --no-pager -o cat 2>/dev/null | grep -o 'GF5288_[A-Z0-9_]*' | tail -n 1 || true)"
+  echo "INFO  firmware string in journal: ${fw:-not logged}"
+  check "patched libfprint installed" lib_is_goodix
+  check "libfprint held" is_held
+  check "apt pin present" test -f "$PIN_CONF"
+  check "fprintd drop-in present" test -f "$DROPIN"
+  check "fprintd environment effective" env_effective
+  check "USB power/control is on" usb_power_on
+  if [ "$(id -u)" -eq 0 ] || [ -n "$R" ]; then
+    check "PSK present, mode 600" psk_ok
+  else
+    echo "SKIP  PSK check (needs root)"
+  fi
+  check "print store permissions" store_ok
+  check "PAM profile enabled" pam_profile_enabled
+  echo "$PASS passed, $FAIL failed"
+  [ "$FAIL" -eq 0 ]
+}
+
+main() {
+  local c="${1:-}"
+  [ $# -eq 0 ] || shift
+  case "$c" in
+    status) cmd_status ;;
+    doctor) cmd_doctor ;;
+    recover) cmd_recover ;;
+    enroll) cmd_enroll "$@" ;;
+    install-psk) cmd_install_psk "$@" ;;
+    psk-backup) cmd_psk_backup "$@" ;;
+    harden-store) cmd_harden ;;
+    pam) cmd_pam "$@" ;;
+    rollback-stock) cmd_rollback ;;
+    -h|--help|help|"") usage ;;
+    *) usage >&2; die "unknown command: $c" ;;
+  esac
+}
+main "$@"

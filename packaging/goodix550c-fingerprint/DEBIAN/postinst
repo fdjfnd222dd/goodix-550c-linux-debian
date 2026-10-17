@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+case "$1" in
+configure)
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload || true
+        udevadm trigger --action=add --attr-match=idVendor=27c6 --attr-match=idProduct=550c || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl try-restart fprintd.service || true
+    fi
+    # Registers the profile only; it is "Default: no", so it is not enabled here.
+    if command -v pam-auth-update >/dev/null 2>&1; then
+        pam-auth-update --package || true
+    fi
+    ;;
+esac
+exit 0

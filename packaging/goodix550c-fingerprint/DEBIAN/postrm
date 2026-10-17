@@ -1,0 +1,15 @@
+#!/bin/sh
+# Purge deliberately leaves /etc/goodix550c (PSK) and /var/lib/fprint (prints) alone.
+set -e
+case "$1" in
+remove|purge)
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        systemctl try-restart fprintd.service || true
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload || true
+    fi
+    ;;
+esac
+exit 0
