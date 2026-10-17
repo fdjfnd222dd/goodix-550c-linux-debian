@@ -72,7 +72,7 @@ verify_once() {
                 tok="${line#*Verify result: }"; tok="${tok%% *}"
                 logger -t "$TAG" "phase=result run=$RUN_ID result=${tok#verify-} t_ms=$(now_ms)"
                 case "$line" in
-                    *"(not done)"*) say "   Lift. TOUCH NOW again." ;;
+                    *"(not done)"*) say "   Lift. Move a little. TOUCH NOW." ;;
                     *"verify-match"*) RESULT=match ;;
                     *"verify-no-match"*) RESULT=no-match ;;
                 esac ;;
