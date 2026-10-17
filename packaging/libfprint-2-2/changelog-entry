@@ -1,0 +1,9 @@
+libfprint (1:1.94.10+goodix550c@N@) unstable; urgency=medium
+
+  * Local build of libfprint 1.94.10 with the goodix53x5/550c driver.
+  * Patch series sha256: @SERIES_SHA@
+  * Removed usb:v27C6p550C from the autosuspend hwdb (handled by the
+    goodix550c power rules instead).
+
+ -- Local goodix550c build <noreply@localhost>  @DATE_RFC@
+
