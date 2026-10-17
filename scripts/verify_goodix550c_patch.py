@@ -283,6 +283,15 @@ def audit(driver_tree: Path, libfprint_tree: Path) -> list[str]:
         "#define GOODIX_MANUAL_FDT_DOWN_SETTLE_MS 300",
     ):
         require(marker in private, f"tunable default missing: {marker}", failures)
+    # Finger-up wait stays bounded in both polls and wall time (patch 0021).
+    require(
+        "#define GOODIX_FINGER_UP_MAX_MS 20000" in private
+        and "GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS" in scan_raw
+        and "goodix_manual_fdt_finger_up_expired" in scan_raw
+        and "elapsed_ms < GOODIX_FINGER_UP_MAX_MS" in scan_raw,
+        "finger-up wait lost its wall-time or poll-count bound",
+        failures,
+    )
     require(
         "#define GOODIX_ENROLL_SAMPLES 16" in private
         and "#define GOODIX_ENROLL_NO_CONTACT_FRACTION 0.90" in private
