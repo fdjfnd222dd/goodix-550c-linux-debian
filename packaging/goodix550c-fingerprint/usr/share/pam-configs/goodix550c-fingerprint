@@ -1,0 +1,8 @@
+Name: Goodix 550c fingerprint (sudo/polkit; skips KDE lock screen/SDDM/login)
+Default: no
+Priority: 260
+Conflicts: fprintd
+Auth-Type: Primary
+Auth:
+	[success=1 default=ignore]	pam_succeed_if.so service in kde:kde-fingerprint:sddm:sddm-greeter:login quiet
+	[success=end default=ignore]	pam_fprintd.so max-tries=1 timeout=15
