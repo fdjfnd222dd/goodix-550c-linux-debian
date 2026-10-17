@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fingerprint Lab <noreply@example.invalid>
+Date: Sat, 17 Oct 2026 14:30:00 +0200
+Subject: [PATCH] goodix550c: ask for a longer hold when the probe has no contact
+
+A verify/identify probe whose frame is almost entirely non-contact (more than
+GOODIX_VERIFY_NO_CONTACT_FRACTION, the same 0.90 that patch 0010 uses for
+enrollment) means the finger had already left the pad when the image was read.
+Extracting features from it and scoring it only yields a no-match that makes
+the operator retry for the wrong reason.
+
+Answer it with FP_DEVICE_RETRY_TOO_SHORT before any feature extraction or
+scoring, and do not wait for finger-up for that attempt: the finger is already
+up. The attempt summary reports it as retry:too-short. The match threshold and
+the scoring path are untouched.
+
+---
+
+--- a/drivers/goodix53x5/goodix53x5-auth.c
++++ b/drivers/goodix53x5/goodix53x5-auth.c
+@@ -69,6 +69,7 @@ goodix_summary_result_name (gint result)
+     case GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER: return "retry:remove-finger";
+     case GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID: return "retry:data-invalid";
+     case GOODIX_SUMMARY_RESULT_RETRY_FINGER_PRESENT: return "retry:finger-present";
++    case GOODIX_SUMMARY_RESULT_RETRY_TOO_SHORT: return "retry:too-short";
+     default: return "retry:error";
+     }
+ }
+@@ -236,12 +237,36 @@ goodix_verify_ssm_handler (FpiSsm   *ssm,
+         GoodixMatchInfo *probe_info;
+         int keypoints;
+ 
++        self->summary_noncontact_x1000 =
++          (gint) (self->captured_clipped_fraction * 1000.0 + 0.5);
++
++        /* No contact at all: the finger left before the frame was read. Ask
++         * for a longer hold instead of scoring an empty frame, and skip the
++         * finger-up wait, since the finger is already up. */
++        if (self->captured_clipped_fraction > GOODIX_VERIFY_NO_CONTACT_FRACTION)
++          {
++            self->summary_result = GOODIX_SUMMARY_RESULT_RETRY_TOO_SHORT;
++            if (action == FPI_DEVICE_ACTION_IDENTIFY)
++              {
++                goodix_queue_identify_report (self, NULL,
++                                              fpi_device_retry_new (FP_DEVICE_RETRY_TOO_SHORT));
++              }
++            else
++              {
++                goodix_queue_verify_report (self, FPI_MATCH_ERROR,
++                                            fpi_device_retry_new (FP_DEVICE_RETRY_TOO_SHORT));
++              }
++
++            self->verify_wait_finger_up = FALSE;
++            g_clear_pointer (&self->captured_image, g_free);
++            fpi_ssm_next_state (ssm);
++            return;
++          }
++
+         /* Extract SIFT features once for both identify and verify paths */
+         probe_info = goodix_match_extract (self->captured_image);
+         keypoints = goodix_match_keypoints_count (probe_info);
+         self->summary_keypoints = keypoints;
+-        self->summary_noncontact_x1000 =
+-          (gint) (self->captured_clipped_fraction * 1000.0 + 0.5);
+ 
+         if (keypoints < GOODIX_MIN_CAPTURE_KEYPOINTS)
+           {
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -102,6 +102,14 @@ typedef enum
+  * chasing a placement problem they do not have. */
+ #define GOODIX_ENROLL_NO_CONTACT_FRACTION 0.90
+ 
++/* Verification counterpart of the enrollment limit above. A probe frame that
++ * is almost entirely non-contact holds nothing to score: the finger had
++ * already left the pad when the image was read. Scoring it can only produce a
++ * no-match that costs the operator a retry for the wrong reason, so it is
++ * answered with FP_DEVICE_RETRY_TOO_SHORT before any feature extraction. The
++ * finger is already up, so no finger-up wait follows. */
++#define GOODIX_VERIFY_NO_CONTACT_FRACTION GOODIX_ENROLL_NO_CONTACT_FRACTION
++
+ /* The no-finger reference frame is subtracted from every capture, so one that
+  * carries no signal silently changes the preprocessing rather than failing.
+  * Healthy frames average about 2350 here; frames read while the sensor had
+@@ -347,4 +355,5 @@ typedef enum
+   GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER,
+   GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID,
+   GOODIX_SUMMARY_RESULT_RETRY_FINGER_PRESENT,
++  GOODIX_SUMMARY_RESULT_RETRY_TOO_SHORT,
+ } GoodixSummaryResult;

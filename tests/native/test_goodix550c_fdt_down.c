@@ -125,10 +125,40 @@ test_sibling_layout_stays_prefixed (void)
                  "sibling path changed its threshold");
 }
 
+/* The open sequence's PSK-slot read must be byte-identical to
+ * READ_PSK_HASH_PAYLOAD in src/goodix550c/protocol.py:
+ * len=32, off=0, slot=0xbb020001, 0 (all little-endian). */
+static gboolean
+test_psk_hash_read_payload (void)
+{
+  static const guint8 expected[16] = {
+    0x20, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x02, 0xbb,
+    0x00, 0x00, 0x00, 0x00,
+  };
+  FpiDeviceGoodix53x5 device = { 0 };
+  FpiSsm *ssm = GSIZE_TO_POINTER (3);
+
+  memset (&captured, 0, sizeof (captured));
+  device.variant = GOODIX_VARIANT_TLS_PSK;
+  goodix_cmd_preset_psk_read (ssm, (FpDevice *) &device, 0xbb020001u, 32, 0);
+
+  return expect (captured.calls == 1, "PSK read did not submit exactly one command") &&
+         expect (captured.category == 0x0e && captured.command == 0x02,
+                 "PSK read is not 0xE4") &&
+         expect (captured.expect_data, "PSK read must expect a data reply") &&
+         expect (captured.payload_len == sizeof (expected),
+                 "PSK read payload length changed") &&
+         expect (memcmp (captured.payload, expected, sizeof (expected)) == 0,
+                 "PSK read payload differs from protocol.py READ_PSK_HASH_PAYLOAD");
+}
+
 int
 main (void)
 {
-  if (!test_tls_13021_frame () || !test_sibling_layout_stays_prefixed ())
+  if (!test_tls_13021_frame () || !test_sibling_layout_stays_prefixed () ||
+      !test_psk_hash_read_payload ())
     return 1;
 
   puts ("Goodix firmware-13021 native FDT-down frame test passed.");

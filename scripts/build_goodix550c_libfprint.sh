@@ -179,6 +179,14 @@ cc -std=c11 -Wall -Wextra -Werror \
     -o "$BUILD_DIR/test-goodix550c-tls"
 "$BUILD_DIR/test-goodix550c-tls"
 
+cc -std=c11 -Wall -Wextra -Werror \
+    -I"$DRIVER_STAGE/drivers/goodix53x5" \
+    "$PROJECT_ROOT/tests/native/test_goodix550c_psk_hash.c" \
+    "$DRIVER_STAGE/drivers/goodix53x5/goodix53x5-tls.c" \
+    $(pkg-config --cflags --libs gio-2.0 openssl) \
+    -o "$BUILD_DIR/test-goodix550c-psk-hash"
+"$BUILD_DIR/test-goodix550c-psk-hash"
+
 # Compile the patched production command path and protocol encoder directly.
 # The forced test shim replaces only the final transport submission with an
 # in-memory capture, so this regression cannot access USB.
