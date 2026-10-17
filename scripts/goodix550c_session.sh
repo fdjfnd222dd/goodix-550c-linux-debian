@@ -47,7 +47,7 @@ verify_once() {
     RESULT=other
     while IFS= read -r line; do
         case "$line" in
-            *"Verify started"*) say "   >>> TOUCH THE SENSOR NOW (rest flat ~1 sec, then lift) <<<" ;;
+            *"Verify started"*) [[ -n "${QUIET_START:-}" ]] || say "   >>> TOUCH THE SENSOR NOW (rest flat ~1 sec, then lift) <<<" ;;
             *"Verify result:"*"(not done)"*) say "   ...didn't read it. Lift, then TOUCH AGAIN." ;;
             *"verify-match"*) RESULT=match ;;
             *"verify-no-match"*) RESULT=no-match ;;
@@ -88,17 +88,19 @@ b2() {
     local label=present-at-start count=8 i
     mark_start_time
     echo
-    say "=== Finger-already-on-the-pad test (RIGHT INDEX) ==="
-    echo "    Each round: put your finger ON the sensor and LEAVE it there."
-    echo "    After 3 sec it says LIFT. Lift, then touch again when it says TOUCH NOW."
+    say "=== Finger-already-on-the-pad test (RIGHT INDEX, 8 rounds) ==="
+    echo "    Each round has 3 steps. Just do what the BIG line says:"
+    echo "      1) PUT finger ON and HOLD   2) LIFT   3) TAP once"
+    sleep 4
     for ((i = 1; i <= count; i++)); do
         echo
-        say "[$i/$count] PUT YOUR FINGER ON THE SENSOR NOW and keep it there"
+        echo "[$i/$count]"
+        say "   1) PUT your finger ON the sensor and HOLD it there"
         sleep 3
         next_run "$label"
         marker_start "$label" "$FINGER"
-        ( sleep 3; say "   >>> LIFT your finger now <<<" ) &
-        verify_once
+        ( sleep 3; say "   2) LIFT your finger off"; sleep 2; say "   3) TAP the sensor once now" ) &
+        QUIET_START=1 verify_once
         wait
         marker_end
         ((i < count)) && pause_next
@@ -183,6 +185,7 @@ case "${1:-}" in
     b5) b5 ;;
     b6) b6 ;;
     all) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; report "${2:-all}" ;;
+    rest) b2; b3; b4; b5; b6; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-final}" ;;
     final) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-final}" ;;
     baseline|test) rm -f "$START_FILE"; b1; b2; b3; b4; b5; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-${1}}" ;;
     report) report "${2:-session}" ;;
