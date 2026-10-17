@@ -1,0 +1,19 @@
+Package: libfprint-2-2
+Version: 1:1.94.10+goodix550c@N@
+Architecture: amd64
+Maintainer: Local goodix550c build <noreply@localhost>
+Section: libs
+Priority: optional
+Multi-Arch: same
+Installed-Size: @INSTALLED_SIZE@
+Depends: libc6 (>= 2.38), libgcc-s1 (>= 3.0), libglib2.0-0t64 (>= 2.68.0), libgusb2 (>= 0.2.4), libopencv-core410 (>= 4.10.0+dfsg), libopencv-features2d410 (>= 4.10.0+dfsg), libopencv-imgproc410 (>= 4.10.0+dfsg), libssl3t64 (>= 3.0.0), libstdc++6 (>= 12)
+Provides: libfprint-2-2 (= 1:1.94.10), libfprint-goodix550c (= @N@)
+Homepage: https://www.freedesktop.org/wiki/Software/fprint/libfprint
+Description: fprint fingerprint library (local patched build, goodix 27c6:550c)
+ Local rebuild of libfprint 1.94.10 with the goodix53x5/550c driver compiled in,
+ replacing the stock libfprint-2-2 so fprintd can use the Goodix 27c6:550c sensor.
+ Based on the Debian 1:1.94.9-1 package layout (shlibs, symbols, triggers, docs).
+ Pin/hold this package; do not let archive updates overwrite it.
+ .
+ Patch series sha256: @SERIES_SHA@
+ See /usr/share/doc/libfprint-2-2/GOODIX550C-BUILD for build details.
