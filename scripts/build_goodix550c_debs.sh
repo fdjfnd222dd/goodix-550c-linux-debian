@@ -28,7 +28,7 @@ Options:
                      wiped on every run
   --pkg NAME         package to build: libfprint-2-2 (default) or
                      goodix550c-fingerprint (arch all, from
-                     packaging/goodix550c-fingerprint/; uses --out and --work only)
+                     packaging/goodix550c-fingerprint/ plus tui/goodix550c_tui; uses --out and --work only)
   -h, --help         this help
 USAGE
 }
@@ -73,9 +73,14 @@ build_fingerprint_pkg() {
   rm -rf "$stage"
   mkdir -p "$stage"
   cp -a "$src/." "$stage/"
+  # the "finger" TUI (python package) lives in tui/ in the repo and is staged into dist-packages
+  local tui_src="$ROOT/tui/goodix550c_tui" tui_dst="$stage/usr/lib/python3/dist-packages/goodix550c_tui"
+  [ -f "$tui_src/app.py" ] || die "missing $tui_src/app.py"
+  mkdir -p "$tui_dst"
+  ( cd "$tui_src" && find . -name '*.py' -type f -print0 | xargs -0 -I{} cp --parents {} "$tui_dst/" )
   find "$stage" -type d -exec chmod 0755 {} +
   find "$stage" -type f -not -path "$stage/DEBIAN/*" -exec chmod 0644 {} +
-  chmod 0755 "$stage/usr/sbin/goodix550c-ctl"
+  chmod 0755 "$stage/usr/sbin/goodix550c-ctl" "$stage/usr/bin/finger" "$stage/usr/bin/goodix550c-tui"
   size="$(du -sk --exclude=DEBIAN "$stage" | cut -f1)"
   sed -i "s/@INSTALLED_SIZE@/$size/g" "$stage/DEBIAN/control"
   ( cd "$stage" && find . -path ./DEBIAN -prune -o -type f -print | LC_ALL=C sort | sed 's|^\./||' | xargs -d '\n' md5sum ) > "$stage/DEBIAN/md5sums"

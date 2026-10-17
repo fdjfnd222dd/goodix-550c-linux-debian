@@ -1,0 +1,3 @@
+#!/bin/sh
+# finger - full-screen fingerprint helper (Goodix 550c). Also installed as goodix550c-tui.
+exec /usr/bin/python3 -m goodix550c_tui "$@"

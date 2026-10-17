@@ -7,6 +7,9 @@ remove|purge)
         systemctl daemon-reload || true
         systemctl try-restart fprintd.service || true
     fi
+    # byte-code written at run time is not owned by dpkg
+    rm -rf /usr/lib/python3/dist-packages/goodix550c_tui/__pycache__ || true
+    rmdir /usr/lib/python3/dist-packages/goodix550c_tui 2>/dev/null || true
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload || true
     fi

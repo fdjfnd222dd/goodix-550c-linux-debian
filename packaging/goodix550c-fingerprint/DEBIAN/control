@@ -1,18 +1,20 @@
 Package: goodix550c-fingerprint
-Version: 1.0.2
+Version: 1.1.0
 Architecture: all
 Maintainer: Local goodix550c build <noreply@localhost>
 Section: utils
 Priority: optional
-Depends: libfprint-goodix550c (>= 3), fprintd, libpam-fprintd, udev
+Depends: libfprint-goodix550c (>= 3), fprintd, libpam-fprintd, udev, python3, python3-textual (>= 2.1), python3-rich
 Recommends: tlp
+Conflicts: finger
 Installed-Size: @INSTALLED_SIZE@
 Homepage: https://github.com/the-great-king-bart/goodix-550c-linux-driver
 Description: configuration and tooling for the Goodix 27c6:550c fingerprint sensor
  Drop-in for fprintd (driver allow-list, runtime gates, PSK file path),
  udev rule keeping USB autosuspend off for the sensor, TLP denylist, an apt
  pin for the patched libfprint-2-2, an opt-in pam-auth-update profile and the
- goodix550c-ctl helper.
+ goodix550c-ctl helper, plus the full-screen
+ "finger" terminal app (alias goodix550c-tui) for enrolling and testing fingers.
  .
  The pre-shared key is NOT part of this package: install it with
  "goodix550c-ctl install-psk FILE". The PAM profile is not enabled

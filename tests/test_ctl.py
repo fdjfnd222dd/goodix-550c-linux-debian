@@ -26,7 +26,7 @@ def deb(tmp_path_factory):
     out = tmp_path_factory.mktemp("out")
     r = run([BUILD, "--pkg", "goodix550c-fingerprint", "--out", out, "--work", out / "w"])
     assert r.returncode == 0, r.stderr
-    d = out / "goodix550c-fingerprint_1.0.2_all.deb"
+    d = out / "goodix550c-fingerprint_1.1.0_all.deb"
     assert d.exists()
     return d
 
@@ -38,8 +38,11 @@ def field(deb, name):
 def test_control(deb):
     assert field(deb, "Package") == "goodix550c-fingerprint"
     assert field(deb, "Architecture") == "all"
-    assert field(deb, "Version") == "1.0.2"
-    assert field(deb, "Depends") == "libfprint-goodix550c (>= 3), fprintd, libpam-fprintd, udev"
+    assert field(deb, "Version") == "1.1.0"
+    assert field(deb, "Depends") == (
+        "libfprint-goodix550c (>= 3), fprintd, libpam-fprintd, udev, python3, python3-textual (>= 2.1), python3-rich"
+    )
+    assert field(deb, "Conflicts") == "finger"
     assert field(deb, "Recommends") == "tlp"
     assert "@" not in field(deb, "Installed-Size")
 
@@ -53,12 +56,23 @@ def test_contents(deb):
         "./etc/apt/preferences.d/goodix550c-libfprint",
         "./usr/share/pam-configs/goodix550c-fingerprint",
         "./usr/sbin/goodix550c-ctl",
+        "./usr/bin/finger",
+        "./usr/bin/goodix550c-tui",
+        "./usr/lib/python3/dist-packages/goodix550c_tui/app.py",
+        "./usr/lib/python3/dist-packages/goodix550c_tui/pages.py",
+        "./usr/lib/python3/dist-packages/goodix550c_tui/backend.py",
+        "./usr/lib/python3/dist-packages/goodix550c_tui/demo.py",
+        "./usr/lib/python3/dist-packages/goodix550c_tui/__main__.py",
     ]:
         assert path in listing, path
     for forbidden in ["system-sleep", "unstick", "/opt/", ".psk"]:
         assert forbidden not in listing
-    ctl = [l for l in listing.splitlines() if l.endswith("usr/sbin/goodix550c-ctl")][0]
-    assert ctl.startswith("-rwxr-xr-x root/root")
+    for exe in ("usr/sbin/goodix550c-ctl", "usr/bin/finger", "usr/bin/goodix550c-tui"):
+        line = [l for l in listing.splitlines() if l.endswith(exe)][0]
+        assert line.startswith("-rwxr-xr-x root/root"), line
+    assert "__pycache__" not in listing and ".pyc" not in listing
+    mod = [l for l in listing.splitlines() if l.endswith("goodix550c_tui/app.py")][0]
+    assert mod.startswith("-rw-r--r-- root/root")
 
 
 def test_conffiles(deb):
@@ -105,7 +119,7 @@ def test_refuse_overwrite(tmp_path):
     assert run(args).returncode == 0
     r = run(args)
     assert r.returncode != 0 and "refusing to overwrite" in r.stderr
-    assert "goodix550c-fingerprint_1.0.2_all.deb" in (tmp_path / "SHA256SUMS").read_text()
+    assert "goodix550c-fingerprint_1.1.0_all.deb" in (tmp_path / "SHA256SUMS").read_text()
 
 
 @pytest.mark.parametrize("name", SCRIPTS)
@@ -254,3 +268,149 @@ def test_pam_enable_normalizes_max_tries(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "max-tries=3" in (root / "etc/pam.d/common-auth").read_text()
     assert "--enable goodix550c-fingerprint" in (root / "pau.args").read_text()
+
+
+# ---- status --json and pam set (finger TUI support) ----
+
+PROFILE_TEXT = (
+    "Name: Goodix 550c fingerprint\nDefault: no\nPriority: 260\nConflicts: fprintd\nAuth-Type: Primary\nAuth:\n"
+    "\t[success=1 default=ignore]\tpam_succeed_if.so service in kde:kde-fingerprint:sddm:sddm-greeter:login quiet\n"
+    "\t[success=end default=ignore]\tpam_fprintd.so max-tries=3 timeout=15\n"
+)
+GENERATED_AUTH = (
+    "auth\t[success=2 default=ignore]\tpam_succeed_if.so service in kde:kde-fingerprint:sddm:sddm-greeter:login quiet\n"
+    "auth\t[success=end default=ignore]\tpam_fprintd.so max-tries=3 timeout=15\n"
+)
+
+
+def pam_root(tmp_path, enabled=True):
+    env = ctl_env(tmp_path)
+    root = Path(env["GOODIX550C_ROOT"])
+    prof = root / "usr/share/pam-configs/goodix550c-fingerprint"
+    prof.parent.mkdir(parents=True)
+    prof.write_text(PROFILE_TEXT)
+    (root / "etc/pam.d/common-auth").write_text(GENERATED_AUTH if enabled else "auth sufficient pam_unix.so\n")
+    shimdir = tmp_path / "pshim"
+    shimdir.mkdir()
+    pau = shimdir / "pam-auth-update"
+    pau.write_text('#!/bin/sh\necho "$@" >> "$GOODIX550C_ROOT/pau.args"\n')
+    pau.chmod(0o755)
+    env["PATH"] = f"{shimdir}:{env['PATH']}"
+    return env, root
+
+
+def test_status_json_fake_root(tmp_path):
+    import json
+
+    env, root = pam_root(tmp_path)
+    r = run([CTL, "status", "--json"], env=env)
+    assert r.returncode == 0, r.stderr
+    d = json.loads(r.stdout)
+    assert d["sensor_present"] is True and d["usb_power"] == "on"
+    assert d["pam_enabled"] is True and d["pam_tries"] == 3 and d["pam_timeout"] == 15
+    assert d["psk_present"] is False and isinstance(d["held"], bool) and isinstance(d["patched"], bool)
+    (root / "etc/goodix550c/goodix550c.psk").write_text("a" * 64)
+    assert json.loads(run([CTL, "status", "--json"], env=env).stdout)["psk_present"] is True
+    assert r.stdout.count("\n") == 1                       # one object, one line
+    assert "a" * 64 not in r.stdout
+
+
+def test_status_json_real_system_non_root_is_valid_json():
+    import json
+
+    r = run([CTL, "status", "--json"])
+    assert r.returncode == 0, r.stderr
+    d = json.loads(r.stdout)
+    if os.geteuid() != 0:
+        assert d["psk_present"] is None                   # cannot be checked without root
+    for key in ("sensor_present", "patched", "held", "pam_enabled", "pam_tries", "pam_timeout", "store_ok"):
+        assert key in d
+
+
+def test_status_rejects_unknown_option(tmp_path):
+    assert run([CTL, "status", "--bogus"], env=ctl_env(tmp_path)).returncode != 0
+
+
+def test_pam_set_writes_conf_profile_and_common_auth(tmp_path):
+    env, root = pam_root(tmp_path)
+    r = run([CTL, "pam", "set", "--tries", "5", "--timeout", "22"], env=env)
+    assert r.returncode == 0, r.stderr
+    conf = root / "etc/goodix550c/pam.conf"
+    assert conf.read_text() == "TRIES=5\nTIMEOUT=22\n"
+    assert oct(conf.stat().st_mode & 0o777) == "0o600"
+    assert "pam_fprintd.so max-tries=5 timeout=22" in (root / "usr/share/pam-configs/goodix550c-fingerprint").read_text()
+    assert "pam_fprintd.so max-tries=5 timeout=22" in (root / "etc/pam.d/common-auth").read_text()
+    assert "--force --enable goodix550c-fingerprint" in (root / "pau.args").read_text()
+    assert "pam_succeed_if.so service in kde" in (root / "etc/pam.d/common-auth").read_text()   # rest untouched
+    # status reflects it
+    import json
+    d = json.loads(run([CTL, "status", "--json"], env=env).stdout)
+    assert (d["pam_tries"], d["pam_timeout"]) == (5, 22)
+
+
+def test_pam_set_single_value_keeps_the_other(tmp_path):
+    env, root = pam_root(tmp_path)
+    assert run([CTL, "pam", "set", "--timeout", "9"], env=env).returncode == 0
+    assert (root / "etc/goodix550c/pam.conf").read_text() == "TRIES=3\nTIMEOUT=9\n"
+
+
+def test_pam_set_validates_before_touching_anything(tmp_path):
+    env, root = pam_root(tmp_path)
+    for args in (["--tries", "0", "--timeout", "15"], ["--tries", "6", "--timeout", "15"],
+                 ["--tries", "3", "--timeout", "4"], ["--tries", "3", "--timeout", "31"],
+                 ["--tries", "x", "--timeout", "15"], ["--tries", "3", "--timeout", "1e1"],
+                 ["--tries", "03", "--timeout", "15"], ["--tries"], [], ["--what", "1"]):
+        r = run([CTL, "pam", "set", *args], env=env)
+        assert r.returncode != 0, args
+    assert not (root / "etc/goodix550c/pam.conf").exists()
+    assert (root / "usr/share/pam-configs/goodix550c-fingerprint").read_text() == PROFILE_TEXT
+    assert not (root / "pau.args").exists()
+
+
+def test_pam_set_when_profile_not_enabled_only_saves(tmp_path):
+    env, root = pam_root(tmp_path, enabled=False)
+    r = run([CTL, "pam", "set", "--tries", "2", "--timeout", "10"], env=env)
+    assert r.returncode == 0, r.stderr
+    assert "not enabled" in r.stdout
+    assert "max-tries=2 timeout=10" in (root / "usr/share/pam-configs/goodix550c-fingerprint").read_text()
+    assert not (root / "pau.args").exists()
+    assert run([CTL, "pam", "enable"], env=env).returncode == 0
+    assert "--enable goodix550c-fingerprint" in (root / "pau.args").read_text()
+
+
+def test_pam_set_requires_root_without_fake_root():
+    if os.geteuid() == 0:
+        pytest.skip("running as root")
+    r = run([CTL, "pam", "set", "--tries", "3", "--timeout", "15"])
+    assert r.returncode != 0 and "needs root" in r.stderr
+
+
+def test_pam_enable_normalizes_timeout_too(tmp_path):
+    env, root = pam_root(tmp_path)
+    ca = root / "etc/pam.d/common-auth"
+    ca.write_text(GENERATED_AUTH.replace("max-tries=3 timeout=15", "max-tries=7 timeout=99"))
+    assert run([CTL, "pam", "enable"], env=env).returncode == 0
+    assert "pam_fprintd.so max-tries=3 timeout=15" in ca.read_text()
+
+
+def test_postinst_reapplies_saved_pam_values(tmp_path):
+    """The package ships default values in the profile; postinst must put the saved ones back."""
+    script = (PKGDIR / "DEBIAN" / "postinst").read_text()
+    # run only the re-apply block, against a temp profile and conf
+    start = script.index("    PAMCONF=")
+    end = script.index("    # Registers the profile only")
+    block = script[start:end]
+    prof = tmp_path / "profile"
+    prof.write_text(PROFILE_TEXT)
+    conf = tmp_path / "pam.conf"
+    conf.write_text("TRIES=4\nTIMEOUT=25\n")
+    block = block.replace("/etc/goodix550c/pam.conf", str(conf)).replace(
+        "/usr/share/pam-configs/goodix550c-fingerprint", str(prof))
+    r = subprocess.run(["sh", "-c", block], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "pam_fprintd.so max-tries=4 timeout=25" in prof.read_text()
+    # garbage in the conf is ignored
+    prof.write_text(PROFILE_TEXT)
+    conf.write_text("TRIES=99\nTIMEOUT=-1\n")
+    assert subprocess.run(["sh", "-c", block]).returncode == 0
+    assert prof.read_text() == PROFILE_TEXT
