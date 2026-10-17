@@ -16,12 +16,13 @@ TAG = P + "goodix550c-session[1]: "
 DRV = P + "fprintd[2]: "
 
 
-def attempt(result, best, polls=3, ref_retries=0, action="verify"):
+def attempt(result, best, polls=3, ref_retries=0, action="verify", lift=None):
+    extra = "" if lift is None else f" lift_rebase={lift}"
     return (
         f"{DRV}goodix550c attempt: action={action} ready_to_down_ms=800 down_polls={polls} "
         f"settle_ms=300 ref_mean=2350 ref_retries={ref_retries} noncontact_x1000=120 "
         f"keypoints=80 best_score={best} early_exit=1 threshold=150 result={result} "
-        "dmax_pos=40 dmax_neg=-12"
+        "dmax_pos=40 dmax_neg=-12" + extra
     )
 
 
@@ -145,3 +146,25 @@ def test_manual_pass_fail_is_taken_from_the_end_marker():
 
     assert result["labels"]["suspend"]["n"] == 3
     assert result["labels"]["suspend"]["manual_results"] == {"pass": 2, "fail": 1}
+
+
+def test_lift_rebase_field_is_summed_per_label_and_old_logs_still_parse():
+    text = "\n".join([
+        TAG + "label=genuine finger=right-index run=1",
+        attempt("match", 900, lift=2),
+        TAG + "end run=1",
+        TAG + "label=genuine finger=right-index run=2",
+        attempt("retry:too-short", 0, lift=1),
+        attempt("match", 400),  # line from a build without the field
+        TAG + "end run=2",
+    ])
+    sections, _ = report.parse_sections(text)
+    genuine = report.build_report(sections)["labels"]["genuine"]
+
+    assert genuine["lift_rebaselines"] == 3
+    assert genuine["attempts"] == 3
+    assert genuine["retry_reasons"] == {"too-short": 1}
+    assert "lift re-baselines: 3" in report.render_report(report.build_report(sections))
+    # Logs with no field at all report zero.
+    old, _ = report.parse_sections(SESSION)
+    assert report.build_report(old)["labels"]["genuine"]["lift_rebaselines"] == 0
