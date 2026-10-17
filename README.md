@@ -11,7 +11,7 @@ terminal app (`finger`) to enroll and test your fingers.
 | | |
 |---|---|
 | **Does my laptop work?** | Run `lsusb \| grep 27c6:550c`, then see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Yoga 9 14IAP7 ✅ · Yoga 9 14IRP8 ⚠️ (firmware 13022, testers wanted) |
-| **Install on Debian 13** | [docs/DEBIAN-INSTALL.md](docs/DEBIAN-INSTALL.md) — packages on the [Releases](../../releases) page |
+| **Install on Debian 13** | [docs/DEBIAN-INSTALL.md](docs/DEBIAN-INSTALL.md) — packages on the [Releases](https://github.com/fdjfnd222dd/goodix-550c-linux-debian/releases/latest) page |
 | **Something broke?** | [docs/RECOVERY.md](docs/RECOVERY.md) — one-line recovery and rollback to stock |
 | **How well does it work?** | [docs/measurements.md](docs/measurements.md) — ~85% first-touch match, 0 wrong-finger accepts, 0 sensor-start failures in 100+ opens |
 | **Important** | Unofficial and reverse-engineered. It never writes sensor firmware or keys. You need the **original Windows install** that paired your sensor to recover its key. Your password always keeps working. |
