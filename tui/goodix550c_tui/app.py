@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -24,7 +25,8 @@ from goodix550c_tui.parsers import FINGERS, Attempt, OpenInfo, Status, pretty
 from goodix550c_tui.widgets import ConfirmScreen, keys_line
 
 PAGE_NAMES = {1: "Home", 2: "Enroll", 3: "Test", 4: "Settings", 5: "Help"}
-REFRESH_SECONDS = 8.0
+REFRESH_SECONDS = 8.0          # journal + saved fingers
+STATUS_SECONDS = 30.0          # goodix550c-ctl status is slower, so it is asked less often
 
 
 class FingerApp(App):
@@ -38,7 +40,7 @@ class FingerApp(App):
         Binding("3", "page(3)", "Test", show=False),
         Binding("4", "page(4)", "Settings", show=False),
         Binding("5", "page(5)", "Help", show=False),
-        Binding("e", "enroll", "Enroll", show=False),
+        Binding("e", "page(2)", "Enroll", show=False),
         Binding("t", "page(3)", "Test", show=False),
         Binding("s", "page(4)", "Settings", show=False),
         Binding("left,h", "move(-1,0)", "Left", show=False),
@@ -80,6 +82,7 @@ class FingerApp(App):
         self.opens: list[OpenInfo] = []
         self._msg_timer = None
         self._prev_page = 1
+        self._status_at = 0.0                   # when status was last read (monotonic)
         self.stages_hint: int | None = None     # num-enroll-stages, asked once (read-only D-Bus)
 
     # ---- layout
@@ -96,7 +99,7 @@ class FingerApp(App):
 
     def on_mount(self) -> None:
         self.set_page(1)
-        self.run_worker(self.refresh_data(), group="refresh")
+        self._refresh()
         self.run_worker(self.fetch_stages(), group="stages")
         self.set_interval(REFRESH_SECONDS, self._tick)
 
@@ -121,24 +124,37 @@ class FingerApp(App):
                 self.stages_hint = await self.backend.num_stages()
             except Exception:
                 self.stages_hint = 0
-            self.query_one("#page2").refresh_view()
+            self.query_one("#page2").sync(self.page == 2)
 
-    async def refresh_data(self) -> None:
+    async def refresh_data(self, with_status: bool = True) -> None:
+        """Read the system and redraw what changed. The journal and saved fingers are cheap; the status
+        is only read when asked for (with_status) or when it has never been read."""
         be = self.backend
-        status, fingers, (attempts, opens) = await asyncio.gather(
-            be.status(), be.list_fingers(), be.journal())
-        self.status, self.enrolled = status, set(fingers)
-        self.attempts, self.opens = attempts, opens
-        self.query_one("#page4", SettingsPage).load_from_status()
+        reads = [be.list_fingers(), be.journal()]
+        if with_status or self.status is None:
+            reads.append(be.status())
+        fingers, (attempts, opens), *status = await asyncio.gather(*reads)
+        old = (self.status, self.enrolled, self.attempts, self.opens)
+        if status:
+            self.status, self._status_at = status[0], time.monotonic()
+        self.enrolled, self.attempts, self.opens = set(fingers), attempts, opens
+        loaded = self.query_one("#page4", SettingsPage).load_from_status()
+        if not loaded and old == (self.status, self.enrolled, self.attempts, self.opens):
+            return                                      # nothing new: no redraw at all
         self.refresh_pages()
 
+    def _refresh(self, with_status: bool = True) -> None:
+        self.run_worker(self.refresh_data(with_status), group="refresh")
+
     def _tick(self) -> None:
-        if not self._any_busy() and not self._modal():
-            self.run_worker(self.refresh_data(), group="refresh")
+        if self.page == 5 or self._modal() or self._any_busy():
+            return                                      # nothing on screen would change
+        self._refresh(time.monotonic() - self._status_at >= STATUS_SECONDS)
 
     def refresh_pages(self) -> None:
+        """Redraw the page on screen; the others redraw when they are shown."""
         for i in (1, 2, 3, 4):
-            self.query_one(f"#page{i}").refresh_view()
+            self.query_one(f"#page{i}").sync(i == self.page)
         self.update_chrome()
 
     # ---- chrome
@@ -179,6 +195,9 @@ class FingerApp(App):
 
     def on_resize(self, event) -> None:
         if self.query("#tabs") and self.query("#hint"):
+            for i in PAGE_NAMES:
+                if i != self.page:
+                    self.query_one(f"#page{i}").stale = True      # sized for the old screen
             self.update_chrome()
 
     def say(self, text: str, colour: str = GREEN, seconds: float = 6.0) -> None:
@@ -189,6 +208,8 @@ class FingerApp(App):
 
     # ---- pages
     def set_page(self, n: int) -> None:
+        if n != self.page:
+            self._prev_page = self.page
         self.page = n
         for i in PAGE_NAMES:
             self.query_one(f"#page{i}").display = i == n
@@ -203,66 +224,58 @@ class FingerApp(App):
             return False
         return True
 
+    def _goto(self, n: int) -> None:
+        """Show page n and, unless it is Help, read the system afresh (status included)."""
+        self.set_page(n)
+        if n != 5:
+            self._refresh()
+
     def action_page(self, n: int) -> None:
         if self._switch_ok() and n != self.page:
-            self._prev_page = self.page
-            self.set_page(n)
-            self.run_worker(self.refresh_data(), group="refresh")
+            self._goto(n)
 
     def action_next_page(self) -> None:
         if self._switch_ok():
-            self._prev_page = self.page
-            self.set_page(self.page % len(PAGE_NAMES) + 1)
+            self._goto(self.page % len(PAGE_NAMES) + 1)
 
     def action_help(self) -> None:
-        if not self._switch_ok():
-            return
-        if self.page == 5:
-            self.set_page(self._prev_page)
-        else:
-            self._prev_page = self.page
-            self.set_page(5)
-
-    def action_enroll(self) -> None:
-        if self.page == 2:
-            return
-        self.action_page(2)
+        if self._switch_ok():
+            self._goto(self._prev_page if self.page == 5 else 5)
 
     def go_enroll(self, finger: str) -> None:
         self.sel = FINGERS.index(finger)
         self.action_page(2)
 
     # ---- key routing
-    def action_move(self, dx: int, dy: int) -> None:
+    def _to_page(self, name: str, *args) -> None:
+        """Hand a key to the page on screen (not while a dialog is open)."""
         if not self._modal():
-            self.page_widget().move(dx, dy)
+            getattr(self.page_widget(), name)(*args)
+
+    def action_move(self, dx: int, dy: int) -> None:
+        self._to_page("move", dx, dy)
 
     def action_activate(self) -> None:
-        if not self._modal():
-            self.page_widget().activate()
+        self._to_page("activate")
 
     def action_cancel(self) -> None:
-        if self._modal():
-            return
-        if self.page == 5:
-            self.set_page(self._prev_page)
+        if self.page == 5 and not self._modal():
+            self._goto(self._prev_page)
         else:
-            self.page_widget().cancel()
+            self._to_page("cancel")
 
     def action_delete(self) -> None:
-        if not self._modal():
-            self.page_widget().delete()
+        self._to_page("delete")
 
     def action_apply(self) -> None:
-        if not self._modal():
-            self.page_widget().apply()
+        self._to_page("apply")
 
     def action_reload(self) -> None:
         if self._modal() or self._any_busy():
             return
         if self.page == 4:
             self.page_widget().reload()
-        self.run_worker(self.refresh_data(), group="refresh")
+        self._refresh()
         self.say("Reloaded.", DIM, 2.0)
 
     def move_selection(self, dx: int, dy: int) -> None:
@@ -315,9 +328,8 @@ class FingerApp(App):
             self.say("Settings applied.")
         else:
             self.say(f"The change did not work (exit {rc}). Nothing else was touched.", RED)
-        settings = self.query_one("#page4", SettingsPage)
-        settings._loaded = False
-        self.run_worker(self.refresh_data(), group="refresh")
+        self.query_one("#page4", SettingsPage).invalidate()
+        self._refresh()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -12,19 +12,10 @@ configure)
     if [ -d /run/systemd/system ]; then
         systemctl try-restart fprintd.service || true
     fi
-    # Keep the user's tries/timeout (goodix550c-ctl pam set) across upgrades: the package
-    # ships the defaults in the profile file, so re-apply the saved values before pam-auth-update.
-    PAMCONF=/etc/goodix550c/pam.conf
-    PROFILE=/usr/share/pam-configs/goodix550c-fingerprint
-    if [ -r "$PAMCONF" ] && [ -f "$PROFILE" ]; then
-        SAVED_TRIES="$(sed -n 's/^TRIES=\([1-5]\)$/\1/p' "$PAMCONF" | head -n 1)"
-        SAVED_TIMEOUT="$(sed -n 's/^TIMEOUT=\([0-9][0-9]*\)$/\1/p' "$PAMCONF" | head -n 1)"
-        if [ -n "$SAVED_TRIES" ]; then
-            sed -i "/pam_fprintd\\.so/ s/max-tries=[0-9]*/max-tries=$SAVED_TRIES/" "$PROFILE" || true
-        fi
-        if [ -n "$SAVED_TIMEOUT" ] && [ "$SAVED_TIMEOUT" -ge 5 ] && [ "$SAVED_TIMEOUT" -le 30 ]; then
-            sed -i "/pam_fprintd\\.so/ s/timeout=[0-9]*/timeout=$SAVED_TIMEOUT/" "$PROFILE" || true
-        fi
+    # Keep the user's tries/timeout (goodix550c-ctl pam set) across upgrades: the package ships the
+    # defaults in the profile file, so re-apply the saved values (validated by ctl) before pam-auth-update.
+    if [ -x /usr/sbin/goodix550c-ctl ]; then
+        /usr/sbin/goodix550c-ctl pam apply-saved || true
     fi
     # Registers the profile only; it is "Default: no", so it is not enabled here.
     if command -v pam-auth-update >/dev/null 2>&1; then

@@ -4,7 +4,8 @@ import asyncio
 import os
 import stat
 
-from goodix550c_tui.backend import Backend
+from goodix550c_tui.backend import Backend, journal_cmd, resolve_ctl, root_commands
+from goodix550c_tui.demo import FakeBackend
 
 
 def fake_bin(tmp_path, name, body):
@@ -83,17 +84,18 @@ def test_list_delete_status_journal(tmp_path, monkeypatch):
     dlog = tmp_path / "del"
     d = fake_bin(tmp_path, "fprintd-list", 'echo " - #0: right-thumb"\n')
     fake_bin(tmp_path, "fprintd-delete", f'echo "$@" > {dlog}\necho "Fingerprints deleted"\n')
-    fake_bin(tmp_path, "goodix550c-ctl", 'echo \'{"sensor_present": true, "pam_tries": 2, "pam_timeout": 9}\'\n')
+    ctl = fake_bin(tmp_path, "goodix550c-ctl", 'echo \'{"sensor_present": true, "pam_tries": 2, "pam_timeout": 9}\'\n')
     fake_bin(tmp_path, "journalctl", 'echo "2026-10-17T12:00:11+00:00 h fprintd[1]: goodix550c attempt: action=identify best_score=200 threshold=150 result=match"\n')
     fake_bin(tmp_path, "gdbus", 'case "$*" in *GetDefaultDevice*) echo "(objectpath \'/net/reactivated/Fprint/Device/0\',)";; *) echo "(<8>,)";; esac\n')
     monkeypatch.setenv("PATH", f"{d}:{os.environ['PATH']}")
+    monkeypatch.setenv("GOODIX550C_CTL", str(ctl / "goodix550c-ctl"))
     be = Backend(user="alice")
     assert run(be.list_fingers()) == ["right-thumb"]
     ok, msg = run(be.delete("right-thumb"))
     assert ok and dlog.read_text().split() == ["alice", "-f", "right-thumb"]
     st = run(be.status())
     assert st.sensor_present and (st.pam_tries, st.pam_timeout) == (2, 9)
-    attempts, _ = run(be.journal())
+    attempts, _ = run(be.journal(20))
     assert attempts[0].best_score == 200
     assert run(be.num_stages()) == 8
 
@@ -104,3 +106,23 @@ def test_root_commands_are_only_built_never_run():
     assert be.root_commands(None, None, True) == [["sudo", "goodix550c-ctl", "pam", "enable"]]
     assert be.root_commands(3, 15, False)[-1] == ["sudo", "goodix550c-ctl", "pam", "disable"]
     assert be.root_commands(None, None, None) == []
+
+
+def test_fake_backend_shares_root_commands():
+    assert FakeBackend().root_commands(2, 10, True) == root_commands(2, 10, True)
+    assert Backend(user="a").root_commands(2, 10, True) == root_commands(2, 10, True)
+
+
+def test_journal_window_size():
+    assert journal_cmd(20)[journal_cmd(20).index("-n") + 1] == "20"
+    assert journal_cmd()[journal_cmd().index("-n") + 1] == "200"
+
+
+def test_ctl_path_override_and_missing(tmp_path, monkeypatch):
+    d = fake_bin(tmp_path, "my-ctl", "echo '{}'\n")
+    monkeypatch.setenv("GOODIX550C_CTL", str(d / "my-ctl"))
+    assert resolve_ctl() == str(d / "my-ctl")
+    monkeypatch.setenv("GOODIX550C_CTL", str(tmp_path / "nope"))
+    assert resolve_ctl() is None
+    st = run(Backend(user="a").status())
+    assert st.ctl_missing and "not installed" in st.error

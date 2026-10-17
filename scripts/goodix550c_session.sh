@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Guided fingerprint measurement blocks (user level; no sudo except B5's own prompt).
 #
-#   goodix550c_session.sh b1|b2|b3|b4|b5|b6|all|report [name]
+#   goodix550c_session.sh b1|b2|b3|b4|b5|b6|all|rest|final|baseline|test|report [name]
 #
 # Every run is bracketed by journal markers (logger -t goodix550c-session) that
 # scripts/goodix550c_score_report.py uses to split the fprintd journal by label.
@@ -14,6 +14,23 @@ START_FILE="$STATE_DIR/start"
 FINGER="${FINGER:-right-index}"
 IMPOSTOR_FINGER="${IMPOSTOR_FINGER:-left-index}"
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-30}"
+OUT_DIR="${GOODIX550C_MEASUREMENTS_DIR:-$HOME/goodix550c-debs/measurements}"
+
+# Repetitions per block (usage text and prompts are derived from these).
+B1_COUNT=20   # genuine
+B2_COUNT=8    # finger already on the pad first
+B3_COUNT=8    # impostor
+B4_COUNT=30   # hands-off opens
+B5_COUNT=10   # sudo
+B6_COUNT=3    # suspend
+
+# Timing (seconds); override from the environment.
+LEAD_IN_SECS="${LEAD_IN_SECS:-3}"       # pause after a block's instructions
+B2_INTRO_SECS="${B2_INTRO_SECS:-4}"     # b2 reads a longer 3-step explanation
+HOLD_SECS="${HOLD_SECS:-3}"             # b2: finger held on the pad before/after the run starts
+LIFT_GAP_SECS="${LIFT_GAP_SECS:-2}"     # b2: time between the LIFT and TAP prompts
+PAUSE_SECS="${PAUSE_SECS:-2}"           # between runs
+RELEASE_SECS="${RELEASE_SECS:-2}"       # b4: let fprintd release the device between claims
 RUN_COUNTER=0
 TAG=goodix550c-session
 
@@ -33,12 +50,6 @@ marker_end() { logger -t "$TAG" "end run=$RUN_ID${1:+ result=$1}"; }
 
 BOLD="$(tput bold 2>/dev/null || true)"; NORM="$(tput sgr0 2>/dev/null || true)"
 say() { printf '%s%s%s\n' "$BOLD" "$1" "$NORM"; }
-
-ask() {
-    # ask "prompt" ; returns when the human presses Enter
-    local reply
-    read -r -p "$1 " reply || exit 1
-}
 
 # Streams fprintd-verify so the human sees TOUCH NOW the moment the sensor is ready.
 # Sets RESULT to match|no-match|timeout|other.
@@ -60,7 +71,7 @@ verify_once() {
     esac
 }
 
-pause_next() { echo "   lift your finger... next one in 2 sec"; sleep 2; }
+pause_next() { echo "   lift your finger... next one in $PAUSE_SECS sec"; sleep "$PAUSE_SECS"; }
 
 touch_block() {
     # touch_block <label> <finger> <count> <instruction>
@@ -69,7 +80,7 @@ touch_block() {
     echo
     say "=== $instr ==="
     echo "    ($count times. No Enter needed. Ctrl+C to stop.)"
-    sleep 3
+    sleep "$LEAD_IN_SECS"
     for ((i = 1; i <= count; i++)); do
         echo
         echo "[$i/$count]"
@@ -81,25 +92,30 @@ touch_block() {
     done
 }
 
-b1() { touch_block genuine "$FINGER" 20 "Use your RIGHT INDEX finger. Touch only when it says TOUCH NOW"; }
+b1() { touch_block genuine "$FINGER" "$B1_COUNT" "Use your RIGHT INDEX finger. Touch only when it says TOUCH NOW"; }
 
 b2() {
     # finger already resting on the pad when the action starts
-    local label=present-at-start count=8 i
+    local label=present-at-start count="$B2_COUNT" i
     mark_start_time
     echo
-    say "=== Finger-already-on-the-pad test (RIGHT INDEX, 8 rounds) ==="
+    say "=== Finger-already-on-the-pad test (RIGHT INDEX, $count rounds) ==="
     echo "    Each round has 3 steps. Just do what the BIG line says:"
     echo "      1) PUT finger ON and HOLD   2) LIFT   3) TAP once"
-    sleep 4
+    sleep "$B2_INTRO_SECS"
     for ((i = 1; i <= count; i++)); do
         echo
         echo "[$i/$count]"
         say "   1) PUT your finger ON the sensor and HOLD it there"
-        sleep 3
+        sleep "$HOLD_SECS"
         next_run "$label"
         marker_start "$label" "$FINGER"
-        ( sleep 3; say "   2) LIFT your finger off"; sleep 2; say "   3) TAP the sensor once now" ) &
+        (
+            sleep "$HOLD_SECS"
+            say "   2) LIFT your finger off"; logger -t "$TAG" "phase=lift run=$RUN_ID"
+            sleep "$LIFT_GAP_SECS"
+            say "   3) TAP the sensor once now"; logger -t "$TAG" "phase=tap run=$RUN_ID"
+        ) &
         QUIET_START=1 verify_once
         wait
         marker_end
@@ -107,7 +123,7 @@ b2() {
     done
 }
 
-b3() { touch_block impostor "$IMPOSTOR_FINGER" 8 "Use your LEFT INDEX finger (wrong finger on purpose). Touch when it says TOUCH NOW"; }
+b3() { touch_block impostor "$IMPOSTOR_FINGER" "$B3_COUNT" "Use your LEFT INDEX finger (wrong finger on purpose). Touch when it says TOUCH NOW"; }
 
 b4() {
     mark_start_time
@@ -115,10 +131,10 @@ b4() {
     next_run opens
     marker_start opens none
     local i
-    for ((i = 1; i <= 30; i++)); do
+    for ((i = 1; i <= B4_COUNT; i++)); do
         timeout -s INT 5 fprintd-verify -f any "$USER" >/dev/null 2>&1
-        sleep 2   # let fprintd release the device before the next claim
-        printf "\r   %d/30" "$i"
+        sleep "$RELEASE_SECS"   # let fprintd release the device before the next claim
+        printf "\r   %d/%d" "$i" "$B4_COUNT"
     done
     echo
     marker_end
@@ -126,10 +142,10 @@ b4() {
 
 b5() {
     mark_start_time
-    echo; say "=== sudo test: when sudo says 'Place your finger', touch the sensor ==="; echo "    (10 times, no Enter needed)"
+    echo; say "=== sudo test: when sudo says 'Place your finger', touch the sensor ==="; echo "    ($B5_COUNT times, no Enter needed)"
     local i t0 t1
-    for ((i = 1; i <= 10; i++)); do
-        echo; echo "[$i/10]"
+    for ((i = 1; i <= B5_COUNT; i++)); do
+        echo; echo "[$i/$B5_COUNT]"
         next_run sudo
         marker_start sudo "$FINGER"
         t0=$(date +%s.%N)
@@ -137,17 +153,17 @@ b5() {
         t1=$(date +%s.%N)
         printf '   -> sudo finished in %.1fs\n' "$(echo "$t1 - $t0" | bc)"
         marker_end
-        if ((i < 10)); then pause_next; fi
+        if ((i < B5_COUNT)); then pause_next; fi
     done
 }
 
 b6() {
     mark_start_time
-    echo; say "=== Sleep test (3 rounds) ==="
+    echo; say "=== Sleep test ($B6_COUNT rounds) ==="
     local i answer
-    for ((i = 1; i <= 3; i++)); do
+    for ((i = 1; i <= B6_COUNT; i++)); do
         echo
-        say "[$i/3] Close the lid (or Start menu > Sleep). Wait 10 sec. Open it."
+        say "[$i/$B6_COUNT] Close the lid (or Start menu > Sleep). Wait 10 sec. Open it."
         echo "      On the lock screen, unlock with your FINGER (not the password)."
         echo "      Then come back here and type pass or fail."
         next_run suspend
@@ -161,12 +177,11 @@ b6() {
 }
 
 report() {
-    local name="${1:-session}" since out_dir json py
+    local name="${1:-session}" since json py
     since="${SINCE:-$(cat "$START_FILE" 2>/dev/null || true)}"
     [[ -n "$since" ]] || { echo "No session start recorded; run a block first or set SINCE='YYYY-MM-DD HH:MM:SS'." >&2; exit 1; }
-    out_dir="$HOME/goodix550c-debs/measurements"
-    mkdir -p "$out_dir"
-    json="$out_dir/$(date +%F)-$name.json"
+    mkdir -p "$OUT_DIR"
+    json="$OUT_DIR/$(date +%F)-$name.json"
     py="$ROOT/.venv/bin/python"
     [[ -x "$py" ]] || py=python3
     local log
@@ -177,22 +192,29 @@ report() {
     "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log" --json > "$json" && echo "JSON saved: $json"
 }
 
+# run_set fresh|keep REPORT_NAME BLOCK... : run blocks in order, then report.
+run_set() {
+    local mode="$1" name="$2" blk
+    shift 2
+    [[ "$mode" == fresh ]] && rm -f "$START_FILE"
+    for blk in "$@"; do "$blk"; done
+    echo; say "ALL DONE - tell Claude 'done'"
+    report "$name"
+}
+
 case "${1:-}" in
-    b1) b1 ;;
-    b2) b2 ;;
-    b3) b3 ;;
-    b4) b4 ;;
-    b5) b5 ;;
-    b6) b6 ;;
-    all) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; report "${2:-all}" ;;
-    rest) b2; b3; b4; b5; b6; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-final}" ;;
-    final) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-final}" ;;
-    baseline|test) rm -f "$START_FILE"; b1; b2; b3; b4; b5; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-${1}}" ;;
+    b[1-6]) "$1" ;;
+    all) run_set fresh "${2:-all}" b1 b2 b3 b4 b5 b6 ;;
+    rest) run_set keep "${2:-final}" b2 b3 b4 b5 b6 ;;
+    final) run_set fresh "${2:-final}" b1 b2 b3 b4 b5 b6 ;;
+    baseline|test) run_set fresh "${2:-$1}" b1 b2 b3 b4 b5 ;;
     report) report "${2:-session}" ;;
     *)
-        echo "Usage: $0 b1|b2|b3|b4|b5|b6|all|report [name]" >&2
-        echo "  b1 genuine x20, b2 finger-on-pad-first x10, b3 impostor x10, b4 opens x50," >&2
-        echo "  b5 sudo x10, b6 suspend x5. Env: FINGER, IMPOSTOR_FINGER, SINCE, VERIFY_TIMEOUT." >&2
+        echo "Usage: $0 b1|b2|b3|b4|b5|b6|all|rest|final|baseline|test|report [name]" >&2
+        echo "  b1 genuine x$B1_COUNT, b2 finger-on-pad-first x$B2_COUNT, b3 impostor x$B3_COUNT," >&2
+        echo "  b4 opens x$B4_COUNT, b5 sudo x$B5_COUNT, b6 suspend x$B6_COUNT." >&2
+        echo "  Env: FINGER, IMPOSTOR_FINGER, SINCE, VERIFY_TIMEOUT, GOODIX550C_MEASUREMENTS_DIR," >&2
+        echo "       LEAD_IN_SECS, B2_INTRO_SECS, HOLD_SECS, LIFT_GAP_SECS, PAUSE_SECS, RELEASE_SECS." >&2
         exit 2
         ;;
 esac

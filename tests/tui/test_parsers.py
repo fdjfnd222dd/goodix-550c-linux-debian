@@ -75,7 +75,7 @@ def test_journal():
     assert [a.best_score for a in attempts] == [345, 0, 97]
     assert [a.result for a in attempts] == ["match", "retry:error", "no-match"]
     assert attempts[0].matched and attempts[0].time == "12:00:11" and attempts[0].threshold == 150
-    assert attempts[1].retry and not attempts[1].matched
+    assert not attempts[1].matched and not attempts[1].scored
     assert attempts[1].time == ""            # `-o cat` lines carry no timestamp
     assert attempts[2].action == "verify"
     assert len(opens) == 1 and opens[0].result == "ok" and opens[0].ms == 533 and opens[0].phase == "done"

@@ -144,7 +144,10 @@ def fake_root(tmp_path: Path) -> Path:
     r = tmp_path / "root"
     (r / "etc/goodix550c").mkdir(parents=True)
     (r / "etc/pam.d").mkdir(parents=True)
-    (r / "etc/pam.d/common-auth").write_text("auth [success=2 default=ignore] pam_fprintd.so max-tries=3 timeout=10\n")
+    (r / "etc/pam.d/common-auth").write_text(
+        "# here are the per-package modules (the \"Primary\" block)\n"
+        "auth [success=2 default=ignore] pam_fprintd.so max-tries=3 timeout=10\n"
+        "# end of pam-auth-update config\n")
     (r / "var/lib/fprint").mkdir(parents=True)
     usb = r / "sys/bus/usb/devices/1-3/power"
     usb.mkdir(parents=True)
@@ -262,6 +265,9 @@ def test_pam_enable_normalizes_max_tries(tmp_path):
     pau.chmod(0o755)
     env["PATH"] = f"{shimdir}:{env['PATH']}"
     root = Path(env["GOODIX550C_ROOT"])
+    prof = root / "usr/share/pam-configs/goodix550c-fingerprint"
+    prof.parent.mkdir(parents=True)
+    prof.write_text(PROFILE_TEXT.replace("timeout=15", "timeout=10"))
     ca = root / "etc/pam.d/common-auth"
     ca.write_text(ca.read_text().replace("max-tries=3", "max-tries=7"))
     r = run([CTL, "pam", "enable"], env=env)
@@ -278,8 +284,10 @@ PROFILE_TEXT = (
     "\t[success=end default=ignore]\tpam_fprintd.so max-tries=3 timeout=15\n"
 )
 GENERATED_AUTH = (
+    "# here are the per-package modules (the \"Primary\" block)\n"
     "auth\t[success=2 default=ignore]\tpam_succeed_if.so service in kde:kde-fingerprint:sddm:sddm-greeter:login quiet\n"
     "auth\t[success=end default=ignore]\tpam_fprintd.so max-tries=3 timeout=15\n"
+    "# end of pam-auth-update config\n"
 )
 
 
@@ -374,6 +382,11 @@ def test_pam_set_when_profile_not_enabled_only_saves(tmp_path):
     assert "not enabled" in r.stdout
     assert "max-tries=2 timeout=10" in (root / "usr/share/pam-configs/goodix550c-fingerprint").read_text()
     assert not (root / "pau.args").exists()
+    # a real pam-auth-update would now generate the pam_fprintd line; emulate that
+    gen = root / "generated-auth"
+    gen.write_text(GENERATED_AUTH.replace("max-tries=3 timeout=15", "max-tries=2 timeout=10"))
+    pau = tmp_path / "pshim" / "pam-auth-update"
+    pau.write_text(f'#!/bin/sh\necho "$@" >> "$GOODIX550C_ROOT/pau.args"\ncp {gen} "$GOODIX550C_ROOT/etc/pam.d/common-auth"\n')
     assert run([CTL, "pam", "enable"], env=env).returncode == 0
     assert "--enable goodix550c-fingerprint" in (root / "pau.args").read_text()
 
@@ -394,23 +407,26 @@ def test_pam_enable_normalizes_timeout_too(tmp_path):
 
 
 def test_postinst_reapplies_saved_pam_values(tmp_path):
-    """The package ships default values in the profile; postinst must put the saved ones back."""
+    """The package ships default values in the profile; postinst must put the saved ones back via ctl."""
     script = (PKGDIR / "DEBIAN" / "postinst").read_text()
-    # run only the re-apply block, against a temp profile and conf
-    start = script.index("    PAMCONF=")
-    end = script.index("    # Registers the profile only")
-    block = script[start:end]
-    prof = tmp_path / "profile"
-    prof.write_text(PROFILE_TEXT)
-    conf = tmp_path / "pam.conf"
+    assert "/usr/sbin/goodix550c-ctl pam apply-saved || true" in script
+    env, root = pam_root(tmp_path)
+    prof = root / "usr/share/pam-configs/goodix550c-fingerprint"
+    conf = root / "etc/goodix550c/pam.conf"
     conf.write_text("TRIES=4\nTIMEOUT=25\n")
-    block = block.replace("/etc/goodix550c/pam.conf", str(conf)).replace(
-        "/usr/share/pam-configs/goodix550c-fingerprint", str(prof))
-    r = subprocess.run(["sh", "-c", block], capture_output=True, text=True)
+    r = run([CTL, "pam", "apply-saved"], env=env)
     assert r.returncode == 0, r.stderr
     assert "pam_fprintd.so max-tries=4 timeout=25" in prof.read_text()
+    assert not (root / "pau.args").exists()   # profile file only, no pam-auth-update
     # garbage in the conf is ignored
     prof.write_text(PROFILE_TEXT)
     conf.write_text("TRIES=99\nTIMEOUT=-1\n")
-    assert subprocess.run(["sh", "-c", block]).returncode == 0
+    assert run([CTL, "pam", "apply-saved"], env=env).returncode == 0
     assert prof.read_text() == PROFILE_TEXT
+
+
+def test_pam_enable_postcondition_failure_names_backup(tmp_path):
+    env, root = pam_root(tmp_path, enabled=False)   # shim pam-auth-update generates nothing
+    r = run([CTL, "pam", "enable"], env=env)
+    assert r.returncode != 0
+    assert "sudo cp -a /var/backups/goodix550c/common-auth." in r.stderr
