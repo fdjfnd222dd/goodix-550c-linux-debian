@@ -20,7 +20,9 @@ separately rather than guessed at.
 Session mode.  scripts/goodix550c_session.sh brackets every touch with journal
 markers written by `logger -t goodix550c-session`:
 
-    label=<genuine|impostor|present-at-start|opens|sudo|suspend> finger=<name> run=<id>
+    label=<genuine|impostor|present-at-start|opens|sudo|suspend> finger=<name> run=<id> [t_ms=<epoch ms>]
+    phase=ready run=<id> t_ms=<epoch ms>                 (fprintd-verify printed "Verify started")
+    phase=result run=<id> result=<r> t_ms=<epoch ms>     (a verify result line arrived)
     end run=<id>
 
 Everything between a marker and the next marker belongs to that label.  Each
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import statistics
 import sys
@@ -52,6 +55,7 @@ MARKER_RE = re.compile(
     r"^label=(?P<label>[\w-]+)(?:\s+finger=(?P<finger>\S+))?(?:\s+run=(?P<run>\S+))?"
 )
 END_RE = re.compile(r"^end(?:\s+run=(?P<run>\S+))?(?:\s+result=(?P<result>\w+))?\s*$")
+PHASE_RE = re.compile(r"^phase=(?P<phase>\w+)\b")
 FIELD_RE = re.compile(r"(\w+)=(\S+)")
 
 
@@ -108,6 +112,9 @@ class Section:
         self.legacy_scores: list[int] = []
         self.legacy_threshold = 0
         self.manual_result = ""
+        self.start_ms: int | None = None
+        self.ready_ms: int | None = None
+        self.results: list[tuple[int, str]] = []   # (t_ms, result) in arrival order
 
 
 def parse_sections(text: str) -> tuple[list[Section], bool]:
@@ -130,6 +137,18 @@ def parse_sections(text: str) -> tuple[list[Section], bool]:
             close()
             current = Section(marker.group("label").lower(), marker.group("finger") or "",
                               marker.group("run") or "")
+            t = _fields(msg).get("t_ms")
+            current.start_ms = t if isinstance(t, int) else None
+            continue
+        phase = PHASE_RE.match(msg) if tag is not None else None
+        if phase is not None:
+            f = _fields(msg)
+            t = f.get("t_ms")
+            if isinstance(t, int):
+                if phase.group("phase") == "ready" and current.ready_ms is None:
+                    current.ready_ms = t
+                elif phase.group("phase") == "result":
+                    current.results.append((t, str(f.get("result", "")).removeprefix("verify-")))
             continue
         end = END_RE.match(msg) if tag is not None else None
         if end is not None:
@@ -216,6 +235,11 @@ def summarise_label(label: str, sections: list[Section]) -> dict:
         "opens": len(opens),
         "open_failures_by_phase": dict(sorted(open_failures.items())),
         "median_open_ms": int(statistics.median(open_ms)) if open_ms else None,
+        "near_misses": sum(1 for a in all_attempts
+                           if a.get("result") == "no-match"
+                           and isinstance(a.get("best_score"), int)
+                           and 100 <= a["best_score"] < 150),
+        **_timing(sections, all_attempts),
         "fingers": sorted({sec.finger for sec in sections if sec.finger}),
     }
     manual = [sec.manual_result for sec in sections if sec.manual_result]
@@ -226,6 +250,42 @@ def summarise_label(label: str, sections: list[Section]) -> dict:
         if scores and any(a.get("threshold") for a in all_attempts):
             out["impostor_accepts"] = sum(1 for a in all_attempts if a.get("result") == "match")
     return out
+
+
+def _p90(values: list[int]) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
+
+
+def _median(values: list[int]) -> int | None:
+    return int(statistics.median(values)) if values else None
+
+
+def _timing(sections: list[Section], all_attempts: list[dict]) -> dict:
+    """Time-to-result metrics; every field is None when the log predates the markers."""
+    ready_to_result: list[int] = []
+    totals: list[int] = []
+    for sec in sections:
+        if not sec.results:
+            continue
+        if sec.start_ms is not None:
+            totals.append(sec.results[-1][0] - sec.start_ms)
+        matched = [t for t, r in sec.results if r == "match"]
+        if matched and sec.ready_ms is not None:
+            ready_to_result.append(matched[0] - sec.ready_ms)
+    down = [int(a["down_to_result_ms"]) for a in all_attempts
+            if isinstance(a.get("down_to_result_ms"), int)]
+    return {
+        "ready_to_result_median_ms": _median(ready_to_result),
+        "ready_to_result_p90_ms": _p90(ready_to_result),
+        "ready_to_result_n": len(ready_to_result),
+        "run_total_median_ms": _median(totals),
+        "down_to_result_median_ms": _median(down),
+        "down_to_result_p90_ms": _p90(down),
+        "down_to_result_n": len(down),
+    }
 
 
 def build_report(sections: list[Section]) -> dict:
@@ -261,6 +321,16 @@ def render_report(report: dict) -> str:
         if label == "impostor" and info.get("impostor_max_score") is not None:
             lines.append(f"  impostor max score {info['impostor_max_score']} "
                          f"(accepts: {info.get('impostor_accepts', 'n/a')})")
+        if info.get("near_misses"):
+            lines.append(f"  near misses (no-match, score 100-149): {info['near_misses']}")
+        if info.get("ready_to_result_median_ms") is not None:
+            lines.append(f"  ready->match ms: median {info['ready_to_result_median_ms']}  "
+                         f"p90 {info['ready_to_result_p90_ms']}  (n={info['ready_to_result_n']})")
+        if info.get("run_total_median_ms") is not None:
+            lines.append(f"  verify run total ms: median {info['run_total_median_ms']}")
+        if info.get("down_to_result_median_ms") is not None:
+            lines.append(f"  down->result ms: median {info['down_to_result_median_ms']}  "
+                         f"p90 {info['down_to_result_p90_ms']}  (n={info['down_to_result_n']})")
         if info.get("manual_results"):
             lines.append(f"  manual: {info['manual_results']['pass']} pass, "
                          f"{info['manual_results']['fail']} fail")
@@ -272,6 +342,49 @@ def render_report(report: dict) -> str:
                             if fails else "")
                          + f", median {info['median_open_ms']} ms")
         lines.append("")
+    return "\n".join(lines)
+
+
+COMPARE_ROWS = [
+    ("first_try %", "first_try_match_rate", "pct", True),
+    ("within_2 %", "match_within_2_rate", "pct", True),
+    ("accepts", "impostor_accepts", "int", False),
+    ("max score", "impostor_max_score", "int", False),
+    ("near misses", "near_misses", "int", False),
+    ("ready->match med ms", "ready_to_result_median_ms", "int", False),
+    ("ready->match p90 ms", "ready_to_result_p90_ms", "int", False),
+    ("run total med ms", "run_total_median_ms", "int", False),
+    ("down->result med ms", "down_to_result_median_ms", "int", False),
+]
+
+
+def render_compare(current: dict, baseline: dict) -> str:
+    def val(v, kind):
+        if v is None:
+            return "-"
+        return f"{v * 100:.0f}" if kind == "pct" else str(v)
+
+    def delta(a, b, kind):
+        if a is None or b is None:
+            return "-"
+        d = (a - b) * 100 if kind == "pct" else a - b
+        return f"{d:+.0f}"
+
+    lines = [f"{'':<22}{'baseline':>10}{'current':>10}{'delta':>9}"]
+    for label in ("genuine", "impostor"):
+        cur = current.get("labels", {}).get(label)
+        base = baseline.get("labels", {}).get(label)
+        if cur is None and base is None:
+            continue
+        cur, base = cur or {}, base or {}
+        lines.append(f"[{label}] n: baseline {base.get('n', '-')}, current {cur.get('n', '-')}")
+        for name, key, kind, genuine_only in COMPARE_ROWS:
+            if (label == "impostor") == genuine_only and key in ("first_try_match_rate", "match_within_2_rate"):
+                continue
+            if label == "genuine" and key in ("impostor_accepts", "impostor_max_score"):
+                continue
+            b, c = base.get(key), cur.get(key)
+            lines.append(f"  {name:<20}{val(b, kind):>10}{val(c, kind):>10}{delta(c, b, kind):>9}")
     return "\n".join(lines)
 
 
@@ -321,6 +434,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the per-label summary as JSON instead of text",
     )
+    parser.add_argument(
+        "--compare",
+        type=Path,
+        metavar="BASELINE.json",
+        help="print a side-by-side table of this run against a saved --json report",
+    )
     args = parser.parse_args(argv)
 
     text = args.log.read_text(encoding="utf-8", errors="replace")
@@ -339,6 +458,10 @@ def main(argv: list[str] | None = None) -> int:
         if not report["labels"]:
             print("No match scores in this log.", file=sys.stderr)
             return 1
+        if args.compare is not None:
+            baseline = json.loads(args.compare.read_text(encoding="utf-8"))
+            print(render_compare(report, baseline))
+            return 0
         print(json.dumps(report, indent=2, sort_keys=True) if args.json else render_report(report))
         return 0
 
