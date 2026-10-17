@@ -109,13 +109,14 @@ b3() { touch_block impostor "$IMPOSTOR_FINGER" 8 "Use your LEFT INDEX finger (wr
 
 b4() {
     mark_start_time
-    echo; say "=== HANDS OFF: do NOT touch the sensor for ~4 min (go grab a drink) ==="
+    echo; say "=== HANDS OFF: do NOT touch the sensor for ~4 min ==="
     next_run opens
     marker_start opens none
     local i
-    for ((i = 1; i <= 50; i++)); do
+    for ((i = 1; i <= 30; i++)); do
         timeout -s INT 5 fprintd-verify -f any "$USER" >/dev/null 2>&1
-        printf '\r   %d/50' "$i"
+        sleep 2   # let fprintd release the device before the next claim
+        printf "\r   %d/30" "$i"
     done
     echo
     marker_end
@@ -140,14 +141,17 @@ b5() {
 
 b6() {
     mark_start_time
-    echo "== suspend/resume x5 =="
+    echo; say "=== Sleep test (3 rounds) ==="
     local i answer
-    for ((i = 1; i <= 5; i++)); do
-        echo "[$i/5] Suspend now (Meta menu > Sleep), wake it, unlock the lock screen with your finger."
+    for ((i = 1; i <= 3; i++)); do
+        echo
+        say "[$i/3] Close the lid (or Start menu > Sleep). Wait 10 sec. Open it."
+        echo "      On the lock screen, unlock with your FINGER (not the password)."
+        echo "      Then come back here and type pass or fail."
         next_run suspend
         marker_start suspend "$FINGER"
         while :; do
-            read -r -p "   Did finger unlock work within 2 tries? (pass/fail): " answer || exit 1
+            read -r -p "   Did your finger unlock it (within 2 tries)? type pass or fail: " answer || exit 1
             case "$answer" in pass|fail) break ;; esac
         done
         marker_end "$answer"
@@ -179,6 +183,7 @@ case "${1:-}" in
     b5) b5 ;;
     b6) b6 ;;
     all) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; report "${2:-all}" ;;
+    final) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-final}" ;;
     baseline|test) rm -f "$START_FILE"; b1; b2; b3; b4; b5; echo; say "ALL DONE - tell Claude 'done'"; report "${2:-${1}}" ;;
     report) report "${2:-session}" ;;
     *)
