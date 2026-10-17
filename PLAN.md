@@ -154,3 +154,11 @@ One patch per deb; each judged alone with B1+B2+B3 (~15 min, ~40 touches).
 - `build/rebuild-vi-mfp/source/driver/drivers/goodix53x5/{goodix53x5-session.c,goodix53x5-scan.c,goodix53x5-auth.c,goodix53x5-tls.c,goodix53x5-private.h,goodix53x5-safety.h}` (reference only — changes go in as patches)
 - `src/goodix550c/{usb_probe.py,protocol.py}` (probe behaviour to mirror)
 - `scripts/goodix550c_install_system.sh` (model for packaging/ctl)
+
+## 7. Amendments (from Opus design pass #2, 2026-10-17)
+- **WP0 human backup line** (replaces the cp line; private tgz incl. PSK, probe, pam state):
+  `sudo sh -c 'umask 077; tar -C / -czf /var/backups/goodix550c-state-$(date +%F-%H%M).tgz etc/goodix550c etc/systemd/system/fprintd.service.d etc/pam.d var/lib/pam var/lib/fprint etc/tlp.d/50-goodix550c.conf usr/local/sbin/goodix550c-unstick usr/lib/systemd/system-sleep/goodix550c opt/goodix550c-probe' && sudo ls -l /var/backups/ | grep goodix550c`
+- **WP2**: skip list becomes `service in kde:kde-fingerprint:sddm:sddm-greeter:login`. Before the human applies it, an agent reads `/var/lib/pam/*` + `/usr/share/pam-configs/*`, predicts the generated common-auth and confirms pam-auth-update keeps numeric `success=1` (rewrites only `end`). If not → option B: drop fprintd from common-auth; add fprintd lines only to `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`.
+- **WP4 (f)**: on no-match, wait (bounded ≤1500 ms) for finger-up BEFORE reporting the result, and require 2 consecutive clear polls before "ready" — so the next claim never starts with the finger down. Derive `GOODIX_REF_FINGER_MEAN_MAX` from WP1 ref-mean split (midpoint, ≥150 margin each side) instead of a fixed 2000.
+- **WP6**: add `/etc/apt/preferences.d/goodix550c-libfprint` (pin `1:1.94.10+goodix550c*` priority 1001) in addition to the hold; preinst moves unowned legacy files (`/etc/systemd/system/fprintd.service.d/*goodix550c*`, `/etc/tlp.d/50-goodix550c.conf`, `/usr/local/sbin/goodix550c-unstick`, sleep hook, `/opt/goodix550c-probe`) to `/var/backups/goodix550c-legacy/`; `goodix550c-ctl` gains `pam enable|disable` and `doctor`.
+- **Parallel builds** use separate stage dirs (`build/wpN`); the series stays serial and Opus rebases drafts in order.
