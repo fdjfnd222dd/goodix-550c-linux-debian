@@ -244,12 +244,10 @@ def audit(driver_tree: Path, libfprint_tree: Path) -> list[str]:
     ):
         require(marker in safety, f"manual-FDT gate missing: {marker}", failures)
     for marker in (
-        "GOODIX_MANUAL_FDT_CONFIRMATIONS 2",
-        "GOODIX_MANUAL_FDT_POLL_DELAY_MS 100",
         "goodix_550c_manual_fdt_poll_allowed ()",
         "goodix_cmd_fdt_manual (ssm, dev, TRUE",
         "down = changed_pairs > 0",
-        "state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS",
+        "state->consecutive >= GOODIX_TUNE (self, CONFIRMATIONS)",
         "state->provisional_baseline",
         "GOODIX_REF_CAPTURE_REG_OFF_DONE",
         "Manual FDT finger-down poll armed",
@@ -260,7 +258,6 @@ def audit(driver_tree: Path, libfprint_tree: Path) -> list[str]:
     # Contact is declared on the leading edge of a landing finger, so the
     # capture must not follow it immediately.
     for marker in (
-        "GOODIX_MANUAL_FDT_DOWN_SETTLE_MS 300",
         "GOODIX_FINGER_WAIT_POLL_DOWN_SETTLE",
         "Manual FDT contact settled",
     ):
@@ -269,7 +266,7 @@ def audit(driver_tree: Path, libfprint_tree: Path) -> list[str]:
         re.search(
             r"FP_FINGER_STATUS_NEEDED\);\s*\n\s*fpi_ssm_jump_to_state_delayed \(ssm,\s*\n"
             r"\s*GOODIX_FINGER_WAIT_POLL_DOWN_SETTLE,\s*\n"
-            r"\s*GOODIX_MANUAL_FDT_DOWN_SETTLE_MS\);",
+            r"\s*GOODIX_TUNE \(self, SETTLE_MS\)\);",
             scan_raw,
         )
         is not None,
@@ -279,6 +276,13 @@ def audit(driver_tree: Path, libfprint_tree: Path) -> list[str]:
 
     # Placement tolerance must come from pad coverage, not a weaker gate.
     private = read(driver_dir / "goodix53x5-private.h", failures)
+    # Runtime-tunable defaults equal the historical constants (patch 0020).
+    for marker in (
+        "#define GOODIX_MANUAL_FDT_CONFIRMATIONS 2",
+        "#define GOODIX_MANUAL_FDT_POLL_DELAY_MS 100",
+        "#define GOODIX_MANUAL_FDT_DOWN_SETTLE_MS 300",
+    ):
+        require(marker in private, f"tunable default missing: {marker}", failures)
     require(
         "#define GOODIX_ENROLL_SAMPLES 16" in private
         and "#define GOODIX_ENROLL_NO_CONTACT_FRACTION 0.90" in private
@@ -307,7 +311,7 @@ def audit(driver_tree: Path, libfprint_tree: Path) -> list[str]:
     # per stage rather than once per action.
     require(
         "self->finger_up_keep_awake = FALSE;" in scan_raw
-        and "self->finger_up_keep_awake = self->enroll_stage < GOODIX_ENROLL_SAMPLES;"
+        and "self->finger_up_keep_awake = self->enroll_stage < fp_device_get_nr_enroll_stages (dev);"
         in read(driver_dir / "goodix53x5-enroll.c", failures),
         "enrollment still sleeps the sensor between stages",
         failures,

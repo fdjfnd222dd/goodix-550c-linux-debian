@@ -1,0 +1,673 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fingerprint Lab <noreply@example.invalid>
+Date: Sat, 17 Oct 2026 18:00:00 +0200
+Subject: [PATCH] goodix550c: bounded runtime tunables and attempt timing
+
+Experiments on timing and gate constants used to cost a rebuilt deb each. Read
+a small table of bounded integer overrides from the environment instead
+(GOODIX550C_TUNE_<NAME>=<int>), once per device open, parsed strictly with
+g_ascii_string_to_signed (an invalid value falls back to the default with a
+warning that does not echo it), clamped to a per-entry [min,max] and cached in
+the device. With nothing set every default equals the former constant, so
+behaviour is unchanged. One `goodix550c tune: NAME=value ...` line lists the
+effective integers at open when GOODIX550C_LOG_SUMMARY=1.
+
+Tunable: SETTLE_MS, CONFIRMATIONS, POLL_DELAY_MS, TOUCH_MIN_NEG, LIFT_MIN_POS,
+REF_FINGER_MEAN_MAX, CLEAR_POLLS, UP_WAIT_MS, NONCONTACT_X1000, MIN_KEYPOINTS
+(verify/identify only) and ENROLL_SAMPLES (16..30; nr_enroll_stages is read at
+class init and the enroll state machine takes the count from the class).
+Safety-relevant knobs move only in the stricter direction: more keypoints, a
+smaller allowed non-contact fraction, a larger reference-mean cut, and a
+finger-up hold that can only shorten. Adding one is a single X() line in
+GOODIX_TUNE_TABLE.
+
+Never tunable: GOODIX_SIGFM_BEST_MIN, the persistent-command deny list, the
+firmware gate, PSK handling, self-heal, the clear-window bound. Every maximum
+keeps its wait bounded and no matcher constant is exposed.
+
+The attempt summary gains down_to_result_ms (finger-down confirmed to result
+reported), capture_ms (capture state machine), match_ms (SIGFM extraction and
+comparison up to the queued verdict), templates_scored, best_idx (sample index
+of the best score within its print) and second_best. Log-only; nothing reads
+them.
+---
+diff -ru a/drivers/goodix53x5/goodix53x5-auth.c b/drivers/goodix53x5/goodix53x5-auth.c
+--- a/drivers/goodix53x5/goodix53x5-auth.c
++++ b/drivers/goodix53x5/goodix53x5-auth.c
+@@ -74,6 +74,27 @@
+     }
+ }
+ 
++/* Log-only: counts scored samples and tracks the best and second-best score
++ * and the sample index of the best one. Decides nothing. With the early exit
++ * after a match, later samples are not scored and so not counted. */
++static void
++goodix_summary_note_score (FpiDeviceGoodix53x5 *self,
++                           gint                 score,
++                           gint                 sample_idx)
++{
++  self->summary_templates_scored++;
++  if (self->summary_best_idx < 0 || score > self->summary_top_score)
++    {
++      self->summary_second_best = self->summary_top_score;
++      self->summary_top_score = score;
++      self->summary_best_idx = sample_idx;
++    }
++  else if (score > self->summary_second_best)
++    {
++      self->summary_second_best = score;
++    }
++}
++
+ /* One integer-only line per verify/identify attempt, gated by
+  * GOODIX550C_LOG_SUMMARY=1. g_message reaches the journal without
+  * G_MESSAGES_DEBUG. Reads state only; decides nothing. */
+@@ -83,10 +104,33 @@
+ {
+   gint result = self->summary_result;
+   gint ready_to_down_ms = 0;
++  gint down_to_result_ms = 0;
++  gint capture_ms = 0;
++  gint match_ms = 0;
+ 
+   if (!self->log_summary)
+     return;
+ 
++  /* Timing only: finger-down confirmed to result reported (or to now when
++   * no result was reported before this line), capture state machine, and
++   * SIGFM extract+compare up to the point the verdict was queued. */
++  if (self->summary_down_us != 0)
++    {
++      gint64 end_us = self->summary_result_us != 0 ?
++                      self->summary_result_us : g_get_monotonic_time ();
++
++      if (end_us >= self->summary_down_us)
++        down_to_result_ms = (gint) ((end_us - self->summary_down_us) / 1000);
++    }
++  if (self->summary_capture_start_us != 0 &&
++      self->summary_capture_end_us >= self->summary_capture_start_us)
++    capture_ms = (gint) ((self->summary_capture_end_us -
++                          self->summary_capture_start_us) / 1000);
++  if (self->summary_match_start_us != 0 &&
++      self->summary_match_end_us >= self->summary_match_start_us)
++    match_ms = (gint) ((self->summary_match_end_us -
++                        self->summary_match_start_us) / 1000);
++
+   if (self->summary_ready_us != 0 && self->summary_down_us >= self->summary_ready_us)
+     ready_to_down_ms = (gint) ((self->summary_down_us - self->summary_ready_us) / 1000);
+ 
+@@ -95,7 +139,9 @@
+              "keypoints=%d best_score=%d early_exit=%d threshold=%d "
+              "result=%s dmax_pos=%d dmax_neg=%d "
+              "clear_ms=%d clear_dev_polls=%u clear_rejects=%u "
+-             "up_wait_ms=%d up_first=%d lift_rebase=%u",
++             "up_wait_ms=%d up_first=%d lift_rebase=%u "
++             "down_to_result_ms=%d capture_ms=%d match_ms=%d "
++             "templates_scored=%d best_idx=%d second_best=%d",
+              action == FPI_DEVICE_ACTION_IDENTIFY ? "identify" : "verify",
+              ready_to_down_ms, self->summary_down_polls,
+              self->summary_settle_ms, self->summary_ref_mean,
+@@ -108,7 +154,10 @@
+              self->summary_clear_ms, self->summary_clear_dev_polls,
+              self->clear_reject_streak,
+              self->summary_up_wait_ms, self->summary_up_first,
+-             self->summary_lift_rebases);
++             self->summary_lift_rebases,
++             down_to_result_ms, capture_ms, match_ms,
++             self->summary_templates_scored, self->summary_best_idx,
++             self->summary_second_best);
+ }
+ 
+ /* Verify/Identify SSM */
+@@ -158,6 +207,8 @@
+   self->pending_result_action = FPI_DEVICE_ACTION_VERIFY;
+   self->pending_verify_result = result;
+   self->pending_result_error = error;
++  if (self->summary_match_end_us == 0)
++    self->summary_match_end_us = g_get_monotonic_time ();
+ }
+ 
+ static void
+@@ -172,6 +223,8 @@
+   if (match != NULL)
+     self->pending_identify_match = g_object_ref (match);
+   self->pending_result_error = error;
++  if (self->summary_match_end_us == 0)
++    self->summary_match_end_us = g_get_monotonic_time ();
+ }
+ 
+ void
+@@ -183,6 +236,8 @@
+     return;
+ 
+   self->action_result_reported = TRUE;
++  if (self->summary_result_us == 0)
++    self->summary_result_us = g_get_monotonic_time ();
+ 
+   if (self->pending_result_action == FPI_DEVICE_ACTION_IDENTIFY)
+     {
+@@ -238,13 +293,15 @@
+         GoodixMatchInfo *probe_info;
+         int keypoints;
+ 
++        self->summary_match_start_us = g_get_monotonic_time ();
+         self->summary_noncontact_x1000 =
+           (gint) (self->captured_clipped_fraction * 1000.0 + 0.5);
+ 
+         /* No contact at all: the finger left before the frame was read. Ask
+          * for a longer hold instead of scoring an empty frame, and skip the
+          * finger-up wait, since the finger is already up. */
+-        if (self->captured_clipped_fraction > GOODIX_VERIFY_NO_CONTACT_FRACTION)
++        if (self->captured_clipped_fraction >
++            GOODIX_TUNE (self, NONCONTACT_X1000) / 1000.0)
+           {
+             self->summary_result = GOODIX_SUMMARY_RESULT_RETRY_TOO_SHORT;
+             if (action == FPI_DEVICE_ACTION_IDENTIFY)
+@@ -269,7 +326,7 @@
+         keypoints = goodix_match_keypoints_count (probe_info);
+         self->summary_keypoints = keypoints;
+ 
+-        if (keypoints < GOODIX_MIN_CAPTURE_KEYPOINTS)
++        if (keypoints < GOODIX_TUNE (self, MIN_KEYPOINTS))
+           {
+             self->summary_result = GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER;
+             if (action == FPI_DEVICE_ACTION_IDENTIFY)
+@@ -348,6 +405,7 @@
+                           }
+ 
+                         valid_templates++;
++                        goodix_summary_note_score (self, score, sample_idx);
+                         fp_dbg ("identify: gallery[%u] sample %d sigfm_score %d",
+                                 i, sample_idx, score);
+ 
+@@ -458,6 +516,7 @@
+                           }
+ 
+                         valid_templates++;
++                        goodix_summary_note_score (self, score, sample_idx);
+                         fp_dbg ("verify: sample %d sigfm_score %d",
+                                 sample_idx, score);
+ 
+@@ -649,6 +708,15 @@
+   self->summary_best_score = 0;
+   self->summary_early_exit = FALSE;
+   self->summary_result = GOODIX_SUMMARY_RESULT_NONE;
++  self->summary_capture_start_us = 0;
++  self->summary_capture_end_us = 0;
++  self->summary_match_start_us = 0;
++  self->summary_match_end_us = 0;
++  self->summary_result_us = 0;
++  self->summary_templates_scored = 0;
++  self->summary_best_idx = -1;
++  self->summary_top_score = 0;
++  self->summary_second_best = 0;
+ 
+   ssm = fpi_ssm_new (dev, goodix_verify_ssm_handler,
+                       GOODIX_VERIFY_NUM_STATES);
+diff -ru a/drivers/goodix53x5/goodix53x5.c b/drivers/goodix53x5/goodix53x5.c
+--- a/drivers/goodix53x5/goodix53x5.c
++++ b/drivers/goodix53x5/goodix53x5.c
+@@ -138,7 +138,13 @@
+   dev_class->type = FP_DEVICE_TYPE_USB;
+   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+   dev_class->id_table = goodix53x5_id_table;
+-  dev_class->nr_enroll_stages = GOODIX_ENROLL_SAMPLES;
++  /* Runtime-tunable (GOODIX550C_TUNE_ENROLL_SAMPLES), clamped to 16..30;
++   * unset gives the historical 16. The enroll state machine reads the count
++   * back from the class, so there is one source of truth. */
++  dev_class->nr_enroll_stages = goodix550c_tune_int ("ENROLL_SAMPLES",
++                                                     GOODIX_ENROLL_SAMPLES,
++                                                     GOODIX_ENROLL_SAMPLES_MIN,
++                                                     GOODIX_ENROLL_SAMPLES_MAX);
+   dev_class->temp_hot_seconds = -1; /* Disable thermal throttling — small sensor */
+   dev_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY;
+ 
+diff -ru a/drivers/goodix53x5/goodix53x5-calibration.c b/drivers/goodix53x5/goodix53x5-calibration.c
+--- a/drivers/goodix53x5/goodix53x5-calibration.c
++++ b/drivers/goodix53x5/goodix53x5-calibration.c
+@@ -408,16 +408,27 @@
+  * Everything else is AMBIGUOUS and is not a touch.
+  */
+ GoodixFdtDirection
+-goodix_device_classify_fdt_direction (gint pos,
+-                                      gint neg)
++goodix_device_classify_fdt_direction_with (gint pos,
++                                           gint neg,
++                                           gint touch_min_neg,
++                                           gint lift_min_pos)
+ {
+-  if (neg <= -GOODIX_FDT_TOUCH_MIN_NEG && pos <= -neg)
++  if (neg <= -touch_min_neg && pos <= -neg)
+     return GOODIX_FDT_DIRECTION_TOUCH;
+-  if (pos >= GOODIX_FDT_LIFT_MIN_POS && pos > -neg)
++  if (pos >= lift_min_pos && pos > -neg)
+     return GOODIX_FDT_DIRECTION_LIFT;
+   return GOODIX_FDT_DIRECTION_AMBIGUOUS;
+ }
+ 
++GoodixFdtDirection
++goodix_device_classify_fdt_direction (gint pos,
++                                      gint neg)
++{
++  return goodix_device_classify_fdt_direction_with (pos, neg,
++                                                    GOODIX_FDT_TOUCH_MIN_NEG,
++                                                    GOODIX_FDT_LIFT_MIN_POS);
++}
++
+ /**
+  * goodix_device_generate_fdt_base:
+  *
+diff -ru a/drivers/goodix53x5/goodix53x5-calibration.h b/drivers/goodix53x5/goodix53x5-calibration.h
+--- a/drivers/goodix53x5/goodix53x5-calibration.h
++++ b/drivers/goodix53x5/goodix53x5-calibration.h
+@@ -70,6 +70,13 @@
+ GoodixFdtDirection goodix_device_classify_fdt_direction (gint pos,
+                                                          gint neg);
+ 
++/* Same decision with explicit thresholds (runtime tunables); the function
++ * above uses the compiled defaults. */
++GoodixFdtDirection goodix_device_classify_fdt_direction_with (gint pos,
++                                                              gint neg,
++                                                              gint touch_min_neg,
++                                                              gint lift_min_pos);
++
+ void     goodix_device_generate_fdt_base (const guint8 *fdt_data,
+                                           gsize         len,
+                                           guint8       *fdt_base);
+diff -ru a/drivers/goodix53x5/goodix53x5-enroll.c b/drivers/goodix53x5/goodix53x5-enroll.c
+--- a/drivers/goodix53x5/goodix53x5-enroll.c
++++ b/drivers/goodix53x5/goodix53x5-enroll.c
+@@ -149,7 +149,7 @@
+         self->enroll_stage++;
+ 
+         fp_dbg ("Enrollment stage %d/%d complete",
+-                self->enroll_stage, GOODIX_ENROLL_SAMPLES);
++                self->enroll_stage, fp_device_get_nr_enroll_stages (dev));
+ 
+         fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+         fpi_ssm_next_state (ssm);
+@@ -163,12 +163,12 @@
+        * by hand was what made stages register. Between stages the sleep buys
+        * nothing, because another capture follows immediately. Keep it for the
+        * last one, where the action really is ending. */
+-      self->finger_up_keep_awake = self->enroll_stage < GOODIX_ENROLL_SAMPLES;
++      self->finger_up_keep_awake = self->enroll_stage < fp_device_get_nr_enroll_stages (dev);
+       goodix_scan_start_finger_up_subsm (ssm, dev);
+       break;
+ 
+     case GOODIX_ENROLL_NEXT:
+-      if (self->enroll_stage < GOODIX_ENROLL_SAMPLES)
++      if (self->enroll_stage < fp_device_get_nr_enroll_stages (dev))
+         {
+           if (self->cancel && g_cancellable_is_cancelled (self->cancel))
+             {
+@@ -243,7 +243,7 @@
+ 
+   g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+ 
+-  fp_info ("Enrollment complete with %d samples", GOODIX_ENROLL_SAMPLES);
++  fp_info ("Enrollment complete with %d samples", fp_device_get_nr_enroll_stages (dev));
+ 
+   fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+ }
+diff -ru a/drivers/goodix53x5/goodix53x5-private.h b/drivers/goodix53x5/goodix53x5-private.h
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -172,6 +172,93 @@
+  * reported anyway and the ordinary bounded finger-up wait continues. */
+ #define GOODIX_RESULT_FINGER_UP_WAIT_MS 1500
+ 
++/* Manual-FDT timing constants (moved here from goodix53x5-scan.c so the
++ * runtime tunable table below can name them). */
++#define GOODIX_MANUAL_FDT_POLL_DELAY_MS 100
++#define GOODIX_MANUAL_FDT_CONFIRMATIONS 2
++#define GOODIX_MANUAL_FDT_DOWN_SETTLE_MS 300
++
++/* Default of the verify non-contact gate, in thousandths. Equal to
++ * GOODIX_VERIFY_NO_CONTACT_FRACTION (0.90); the gate compares
++ * fraction > x1000 / 1000.0. */
++#define GOODIX_VERIFY_NO_CONTACT_X1000 900
++
++/* Runtime tunables, GOODIX550C_TUNE_<NAME>=<integer> in the environment.
++ *
++ * Read once per device open (goodix_tune_load), parsed strictly, clamped to
++ * [min,max] and cached in the device. Unset or invalid falls back to the
++ * compiled default, which equals the historical constant, so behaviour is
++ * unchanged with no environment. Adding a tunable is one X() line:
++ *   X(NAME, default, min, max)
++ *
++ * Safety-relevant knobs only move in the stricter direction: a larger
++ * keypoint floor, a smaller allowed non-contact fraction, a larger
++ * reference-mean cut, a shorter finger-up hold, never above today's bound.
++ * ENROLL_SAMPLES is also read by class_init (nr_enroll_stages) and the
++ * enroll state machine takes the count from the device class, so the two
++ * cannot disagree.
++ *
++ * NEVER list here: the match acceptance threshold, the clear-window bound, the persistent-command
++ * deny list, the firmware gate, PSK handling, or anything that would make a
++ * wait unbounded. Every max below keeps its wait finite. */
++#define GOODIX_ENROLL_SAMPLES_MIN 16
++#define GOODIX_ENROLL_SAMPLES_MAX 30
++
++#define GOODIX_TUNE_TABLE(X) \
++  X (SETTLE_MS,        GOODIX_MANUAL_FDT_DOWN_SETTLE_MS,  100,  500)  \
++  X (CONFIRMATIONS,    GOODIX_MANUAL_FDT_CONFIRMATIONS,     1,    3)  \
++  X (POLL_DELAY_MS,    GOODIX_MANUAL_FDT_POLL_DELAY_MS,    50,  150)  \
++  X (TOUCH_MIN_NEG,    GOODIX_FDT_TOUCH_MIN_NEG,           15,   35)  \
++  X (LIFT_MIN_POS,     GOODIX_FDT_LIFT_MIN_POS,            15,   35)  \
++  X (REF_FINGER_MEAN_MAX, GOODIX_REF_FINGER_MEAN_MAX,    2000, 2150)  \
++  X (CLEAR_POLLS,      GOODIX_CLEAR_CONSECUTIVE_POLLS,      1,    3)  \
++  X (UP_WAIT_MS,       GOODIX_RESULT_FINGER_UP_WAIT_MS,   500, 1500)  \
++  X (NONCONTACT_X1000, GOODIX_VERIFY_NO_CONTACT_X1000,    300,  900)  \
++  X (MIN_KEYPOINTS,    GOODIX_MIN_CAPTURE_KEYPOINTS,       20,   60)  \
++  X (ENROLL_SAMPLES,   GOODIX_ENROLL_SAMPLES,  GOODIX_ENROLL_SAMPLES_MIN, GOODIX_ENROLL_SAMPLES_MAX)
++
++typedef enum
++{
++#define GOODIX_TUNE_ENUM(name, def, lo, hi) GOODIX_TUNE_##name,
++  GOODIX_TUNE_TABLE (GOODIX_TUNE_ENUM)
++#undef GOODIX_TUNE_ENUM
++  GOODIX_TUNE_COUNT
++} GoodixTune;
++
++/* Every default must sit inside its own clamp. */
++#define GOODIX_TUNE_CHECK(name, def, lo, hi) \
++  G_STATIC_ASSERT ((lo) <= (def) && (def) <= (hi) && (lo) <= (hi));
++GOODIX_TUNE_TABLE (GOODIX_TUNE_CHECK)
++#undef GOODIX_TUNE_CHECK
++
++#define GOODIX_TUNE(self, name) ((self)->tune[GOODIX_TUNE_##name])
++
++/* Read GOODIX550C_TUNE_<name> (name without prefix). Strict base-10 integer;
++ * unset -> def silently, invalid -> def with a warning (the value is not
++ * echoed); a valid value is clamped to [min,max]. */
++static inline gint
++goodix550c_tune_int (const gchar *name,
++                     gint         def,
++                     gint         min,
++                     gint         max)
++{
++  g_autofree gchar *key = g_strconcat ("GOODIX550C_TUNE_", name, NULL);
++  const gchar *text = g_getenv (key);
++  gint64 value;
++
++  if (text == NULL)
++    return CLAMP (def, min, max);
++
++  if (!g_ascii_string_to_signed (text, 10, G_MININT32, G_MAXINT32, &value, NULL))
++    {
++      g_warning ("goodix550c tune: %s has an invalid value, using default %d",
++                 key, def);
++      return CLAMP (def, min, max);
++    }
++
++  return (gint) CLAMP (value, (gint64) min, (gint64) max);
++}
++
+ /* PSK white box for writing all-zero PSK */
+ #define GOODIX_PSK_WHITE_BOX_LEN 96
+ 
+@@ -332,6 +419,8 @@
+   /* Log-only attempt/open summary state (GOODIX550C_LOG_SUMMARY=1). Nothing
+    * here is read by any decision; it only feeds the integer summary lines. */
+   gboolean   log_summary;
++  /* Effective runtime tunables (GOODIX_TUNE_TABLE), loaded once per open. */
++  gint       tune[GOODIX_TUNE_COUNT];
+   gint64     summary_open_start_us;
+   gint       summary_open_phase;
+ 
+@@ -360,6 +449,15 @@
+   gint       summary_up_wait_ms;
+   gint       summary_up_first;
+   guint      summary_lift_rebases;
++  gint64     summary_capture_start_us;
++  gint64     summary_capture_end_us;
++  gint64     summary_match_start_us;
++  gint64     summary_match_end_us;
++  gint64     summary_result_us;
++  gint       summary_templates_scored;
++  gint       summary_best_idx;
++  gint       summary_top_score;
++  gint       summary_second_best;
+ };
+ 
+ /* Open phases reached, in order, for the open summary line. */
+diff -ru a/drivers/goodix53x5/goodix53x5-scan.c b/drivers/goodix53x5/goodix53x5-scan.c
+--- a/drivers/goodix53x5/goodix53x5-scan.c
++++ b/drivers/goodix53x5/goodix53x5-scan.c
+@@ -31,8 +31,6 @@
+ 
+ #include <string.h>
+ 
+-#define GOODIX_MANUAL_FDT_POLL_DELAY_MS 100
+-#define GOODIX_MANUAL_FDT_CONFIRMATIONS 2
+ #define GOODIX_MANUAL_FDT_LOG_RETRY_INTERVAL 50
+ 
+ /* Contact is declared as soon as one FDT channel pair moves, which is the
+@@ -41,7 +39,6 @@
+  * landed by then: measured non-contact areas of 38.6%, 67.3% and 87.2% on
+  * placements that reached full coverage a moment later. Let the pad finish
+  * loading before reading it. */
+-#define GOODIX_MANUAL_FDT_DOWN_SETTLE_MS 300
+ 
+ /* Phases that wait for the pad to settle must terminate on their own: the
+  * operator is not asked for contact there, so an unstable pad would otherwise
+@@ -183,9 +180,10 @@
+  * Only meaningful for a frame that already passed the signal check.
+  */
+ static gboolean
+-goodix_reference_frame_has_finger (const guint16 *img12)
++goodix_reference_frame_has_finger (const guint16 *img12,
++                                   gint           mean_max)
+ {
+-  return goodix_reference_frame_mean (img12) < GOODIX_REF_FINGER_MEAN_MAX;
++  return goodix_reference_frame_mean (img12) < mean_max;
+ }
+ 
+ static gboolean
+@@ -570,9 +568,9 @@
+             stable = changed_pairs == 0;
+             goodix_manual_fdt_log_poll (state, phase, stable);
+             if (stable &&
+-                state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS &&
++                state->consecutive >= GOODIX_TUNE (self, CONFIRMATIONS) &&
+                 (state->clear_bypass ||
+-                 state->clear_streak >= GOODIX_CLEAR_CONSECUTIVE_POLLS))
++                 state->clear_streak >= GOODIX_TUNE (self, CLEAR_POLLS)))
+               {
+                 if (state->clear_start_us != 0)
+                   {
+@@ -614,7 +612,7 @@
+           return;
+         fpi_ssm_jump_to_state_delayed (ssm,
+                                        GOODIX_REF_CAPTURE_CLEAR_REQUEST,
+-                                       GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++                                       GOODIX_TUNE (self, POLL_DELAY_MS));
+       }
+       break;
+ 
+@@ -750,7 +748,7 @@
+ 
+         /* A frame with signal can still hold a finger. Never store it: retry
+          * while the finger may yet lift, within the same retry budget. */
+-        if (goodix_reference_frame_has_finger (img12))
++        if (goodix_reference_frame_has_finger (img12, GOODIX_TUNE (self, REF_FINGER_MEAN_MAX)))
+           {
+             if (self->reference_retries < GOODIX_REFERENCE_MAX_RETRIES &&
+                 self->reference_finger_retries < GOODIX_REFERENCE_FINGER_MAX_RETRIES)
+@@ -760,7 +758,7 @@
+                 self->summary_ref_retries++;
+                 fp_dbg ("Reference frame mean is below %d, a finger is likely "
+                         "present; retrying (%u/%u)",
+-                        GOODIX_REF_FINGER_MEAN_MAX,
++                        GOODIX_TUNE (self, REF_FINGER_MEAN_MAX),
+                         self->reference_finger_retries,
+                         GOODIX_REFERENCE_FINGER_MAX_RETRIES);
+                 fpi_ssm_jump_to_state_delayed (ssm, GOODIX_REF_CAPTURE_REG_ON,
+@@ -822,7 +820,7 @@
+           g_clear_pointer (&state->provisional_baseline, g_free);
+           fpi_ssm_jump_to_state_delayed (ssm,
+                                          GOODIX_REF_CAPTURE_CLEAR_REQUEST,
+-                                         GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++                                         GOODIX_TUNE (self, POLL_DELAY_MS));
+           return;
+         }
+       fpi_ssm_mark_completed (ssm);
+@@ -1033,7 +1031,7 @@
+                   }
+               }
+ 
+-            if (state->rebase_stable >= GOODIX_MANUAL_FDT_CONFIRMATIONS)
++            if (state->rebase_stable >= GOODIX_TUNE (self, CONFIRMATIONS))
+               {
+                 goodix_manual_fdt_refresh_baseline (self, down_reading);
+                 fp_dbg ("Finger-down baseline refreshed after a lift (%u/%u)",
+@@ -1056,7 +1054,7 @@
+               return;
+             fpi_ssm_jump_to_state_delayed (ssm,
+                                            GOODIX_FINGER_WAIT_POLL_DOWN_REQUEST,
+-                                           GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++                                           GOODIX_TUNE (self, POLL_DELAY_MS));
+             return;
+           }
+ 
+@@ -1078,8 +1076,9 @@
+          * budget is spent, any absolute trigger counts again (old behaviour). */
+         if (down && state->lift_rebases < GOODIX_LIFT_REBASE_MAX)
+           {
+-            GoodixFdtDirection dir = goodix_device_classify_fdt_direction (dir_pos,
+-                                                                           dir_neg);
++            GoodixFdtDirection dir = goodix_device_classify_fdt_direction_with (dir_pos, dir_neg,
++                                                                                GOODIX_TUNE (self, TOUCH_MIN_NEG),
++                                                                                GOODIX_TUNE (self, LIFT_MIN_POS));
+ 
+             if (dir == GOODIX_FDT_DIRECTION_LIFT)
+               {
+@@ -1101,14 +1100,14 @@
+                   return;
+                 fpi_ssm_jump_to_state_delayed (ssm,
+                                                GOODIX_FINGER_WAIT_POLL_DOWN_REQUEST,
+-                                               GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++                                               GOODIX_TUNE (self, POLL_DELAY_MS));
+                 return;
+               }
+             if (dir == GOODIX_FDT_DIRECTION_AMBIGUOUS)
+               down = FALSE;
+           }
+         goodix_manual_fdt_log_poll (state, "finger-down", down);
+-        if (state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS)
++        if (state->consecutive >= GOODIX_TUNE (self, CONFIRMATIONS))
+           {
+             self->summary_down_us = g_get_monotonic_time ();
+             self->summary_down_polls = state->polls;
+@@ -1119,7 +1118,7 @@
+                                                      FP_FINGER_STATUS_NEEDED);
+             fpi_ssm_jump_to_state_delayed (ssm,
+                                            GOODIX_FINGER_WAIT_POLL_DOWN_SETTLE,
+-                                           GOODIX_MANUAL_FDT_DOWN_SETTLE_MS);
++                                           GOODIX_TUNE (self, SETTLE_MS));
+             return;
+           }
+ 
+@@ -1127,7 +1126,7 @@
+           return;
+         fpi_ssm_jump_to_state_delayed (ssm,
+                                        GOODIX_FINGER_WAIT_POLL_DOWN_REQUEST,
+-                                       GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++                                       GOODIX_TUNE (self, POLL_DELAY_MS));
+       }
+       break;
+ 
+@@ -1142,7 +1141,7 @@
+         self->summary_settle_ms =
+           (gint) ((g_get_monotonic_time () - self->summary_down_us) / 1000);
+       fp_dbg ("Manual FDT contact settled for %dms; capturing",
+-              GOODIX_MANUAL_FDT_DOWN_SETTLE_MS);
++              GOODIX_TUNE (self, SETTLE_MS));
+       fpi_ssm_mark_completed (ssm);
+       break;
+     }
+@@ -1163,6 +1162,7 @@
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+     case GOODIX_CAPTURE_REG_ON:
++      self->summary_capture_start_us = g_get_monotonic_time ();
+       if (self->variant == GOODIX_VARIANT_TLS_PSK)
+         goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x03);
+       else
+@@ -1268,6 +1268,7 @@
+       break;
+ 
+     case GOODIX_CAPTURE_STORE:
++      self->summary_capture_end_us = g_get_monotonic_time ();
+       fpi_ssm_mark_completed (ssm);
+       break;
+     }
+@@ -1394,7 +1395,7 @@
+ 
+         up = changed_pairs == 0;
+         goodix_manual_fdt_log_poll (state, "finger-up", up);
+-        if (state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS)
++        if (state->consecutive >= GOODIX_TUNE (self, CONFIRMATIONS))
+           {
+             goodix_manual_fdt_refresh_baseline (self, reading);
+             fp_dbg ("Manual FDT finger-up confirmed after %u polls",
+@@ -1419,11 +1420,11 @@
+          * report now and keep waiting under the ordinary budget below. */
+         if (self->defer_result_report &&
+             (g_get_monotonic_time () - self->up_wait_start_us) / 1000 >=
+-            GOODIX_RESULT_FINGER_UP_WAIT_MS)
++            GOODIX_TUNE (self, UP_WAIT_MS))
+           {
+             fp_dbg ("Finger still down after %dms; reporting the result now",
+-                    GOODIX_RESULT_FINGER_UP_WAIT_MS);
+-            self->summary_up_wait_ms = GOODIX_RESULT_FINGER_UP_WAIT_MS;
++                    GOODIX_TUNE (self, UP_WAIT_MS));
++            self->summary_up_wait_ms = GOODIX_TUNE (self, UP_WAIT_MS);
+             self->summary_up_first = 0;
+             self->defer_result_report = FALSE;
+             goodix_flush_pending_result_report (dev);
+@@ -1437,7 +1438,7 @@
+           return;
+         fpi_ssm_jump_to_state_delayed (ssm,
+                                        GOODIX_FINGER_UP_POLL_REQUEST,
+-                                       GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++                                       GOODIX_TUNE (self, POLL_DELAY_MS));
+       }
+       break;
+     }
+diff -ru a/drivers/goodix53x5/goodix53x5-session.c b/drivers/goodix53x5/goodix53x5-session.c
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -1640,6 +1640,23 @@
+              self->open_tls_retries);
+ }
+ 
++/* Load the runtime tunables once per open and log their effective values
++ * (integers only) when GOODIX550C_LOG_SUMMARY=1. */
++static void
++goodix_tune_load (FpiDeviceGoodix53x5 *self)
++{
++  g_autoptr(GString) line = g_string_new ("goodix550c tune:");
++
++#define GOODIX_TUNE_LOAD(name, def, lo, hi) \
++  GOODIX_TUNE (self, name) = goodix550c_tune_int (#name, (def), (lo), (hi)); \
++  g_string_append_printf (line, " " #name "=%d", GOODIX_TUNE (self, name));
++  GOODIX_TUNE_TABLE (GOODIX_TUNE_LOAD)
++#undef GOODIX_TUNE_LOAD
++
++  if (self->log_summary)
++    g_message ("%s", line->str);
++}
++
+ static void
+ goodix_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ {
+@@ -1679,6 +1696,7 @@
+   self->variant = (GoodixVariant) fpi_device_get_driver_data (dev);
+   self->tls_handshake_done = FALSE;
+   self->log_summary = g_strcmp0 (g_getenv ("GOODIX550C_LOG_SUMMARY"), "1") == 0;
++  goodix_tune_load (self);
+   self->summary_open_start_us = g_get_monotonic_time ();
+   self->summary_open_phase = GOODIX_SUMMARY_PHASE_CLAIM;
+ 
