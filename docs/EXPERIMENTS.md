@@ -77,3 +77,4 @@ UX: on retry say "shift your finger slightly" (retries currently miss 43%).
 | c6 (0020, defaults) | — (timing instrumented) | — | 100% (12) | — | — | 0 (max 0) | kept. down→result 411 ms = settle 300 + capture ~100 + match 5; ready→match 1267 ms incl. reaction |
 | r1 | SETTLE_MS / POLL_DELAY_MS | 300→150 / 100→60 | 92% (12; 1 miss score 6 = coverage, noncontact 0) | — | — | 0 (max 1) | provisional keep: down→result 411→258 ms, detection −80 ms; scores median 531→6598 |
 | r2 | ENROLL_SAMPLES + wide coaching | 16→24, rolls/tips | 92% (12; miss 87) | — | — | 0 (max 9) | revert coaching: 11/12 matches hit one sample (#18 "roll RIGHT"); median score 765 vs 6598. Natural touch ≠ coached centre. Next: 24 natural |
+| r4 confirm | r1 settings, original prints restored | 150/60 | 75% (20): 5 misses all in first 8 (fingertip touches, scores 0–127); last 12/12, median score ~20k | — | — | 0 (max 16, n=8) | keep r1 → baked into goodix550c-fingerprint 1.1.3 drop-in |
