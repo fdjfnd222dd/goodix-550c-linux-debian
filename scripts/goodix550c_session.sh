@@ -207,7 +207,7 @@ report() {
     [[ -x "$py" ]] || py=python3
     local log
     log="$(mktemp)"
-    trap 'rm -f "$log"' RETURN
+    trap 'rm -f "$log"; trap - RETURN' RETURN   # one-shot: must not fire again in run_set
     journalctl --no-pager -o short-iso --since "$since" _SYSTEMD_UNIT=fprintd.service + SYSLOG_IDENTIFIER="$TAG" > "$log"
     "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log"
     "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log" --json > "$json" && echo "JSON saved: $json"
