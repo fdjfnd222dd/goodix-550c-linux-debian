@@ -209,6 +209,9 @@ def summarise_label(label: str, sections: list[Section]) -> dict:
         "first_try_match_rate": _rate(first_try, len(scored_runs)),
         "match_within_2_rate": _rate(within_two, len(scored_runs)),
         "retry_reasons": dict(sorted(reasons.items())),
+        # Absent in logs from builds before patch 0019; counts as zero there.
+        "lift_rebaselines": sum(int(a.get("lift_rebase", 0)) for a in all_attempts
+                                if isinstance(a.get("lift_rebase", 0), int)),
         "score_min": min(scores) if scores else None,
         "score_median": int(statistics.median(scores)) if scores else None,
         "score_max": max(scores) if scores else None,
@@ -253,6 +256,8 @@ def render_report(report: dict) -> str:
         if info["retry_reasons"]:
             lines.append("  retry reasons: " + ", ".join(
                 f"{k}={v}" for k, v in info["retry_reasons"].items()))
+        if info.get("lift_rebaselines"):
+            lines.append(f"  lift re-baselines: {info['lift_rebaselines']}")
         if info["score_min"] is not None:
             lines.append(f"  score min {info['score_min']}  median {info['score_median']}  "
                          f"max {info['score_max']}")

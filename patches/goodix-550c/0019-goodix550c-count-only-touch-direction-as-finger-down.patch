@@ -1,0 +1,341 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fingerprint Lab <noreply@example.invalid>
+Date: Sat, 17 Oct 2026 16:00:00 +0200
+Subject: [PATCH] goodix550c: count only the touch direction as finger-down
+
+Measured over about 150 attempts, a real touch moves the manual-FDT channels
+DOWN against an empty-pad baseline (most negative channel -42..-49 on the >>1
+scale, positive side 0). Every false finger-down seen so far was the opposite:
+the baseline had been taken while the finger was still resting on the pad, and
+the finger lifting moved the channels UP (+45..+50, negative side 0). The
+absolute-delta trigger cannot tell these apart, so the attempt captured an
+empty frame and ended in retry:too-short or retry:remove-finger, which in sudo
+costs a PAM try because users touch the sensor as soon as the prompt appears.
+
+Keep the absolute-delta trigger and add a direction check. A trigger is a touch
+only when its most negative channel is at or below -GOODIX_FDT_TOUCH_MIN_NEG
+and the positive side does not exceed it. A positive-dominant trigger of at
+least GOODIX_FDT_LIFT_MIN_POS is a lift: nothing is captured, the baseline is
+re-taken from the now-empty pad using the same two-stable-readings
+confirmation as the reference clear phase, and the wait for a real touch
+continues. Weaker, mixed triggers are not a touch either and just keep the
+wait going. At most GOODIX_LIFT_REBASE_MAX lifts are absorbed per finger wait,
+each re-baseline is bounded by GOODIX_LIFT_REBASE_MAX_POLLS polls, and once the
+budget is spent the old behaviour applies. The finger-wait state machine is
+shared with enrollment, so enrollment gets the same protection; its stage,
+retry and non-contact handling are unchanged.
+
+The attempt summary line gains an integer lift_rebase=N field. The match
+threshold, suspend refusal while polling, reference checks and logging rules
+are untouched; only counts are logged, never channel values or frames.
+
+---
+
+--- a/drivers/goodix53x5/goodix53x5-auth.c
++++ b/drivers/goodix53x5/goodix53x5-auth.c
+@@ -95,7 +95,7 @@
+              "keypoints=%d best_score=%d early_exit=%d threshold=%d "
+              "result=%s dmax_pos=%d dmax_neg=%d "
+              "clear_ms=%d clear_dev_polls=%u clear_rejects=%u "
+-             "up_wait_ms=%d up_first=%d",
++             "up_wait_ms=%d up_first=%d lift_rebase=%u",
+              action == FPI_DEVICE_ACTION_IDENTIFY ? "identify" : "verify",
+              ready_to_down_ms, self->summary_down_polls,
+              self->summary_settle_ms, self->summary_ref_mean,
+@@ -107,7 +107,8 @@
+              self->summary_dmax_pos, self->summary_dmax_neg,
+              self->summary_clear_ms, self->summary_clear_dev_polls,
+              self->clear_reject_streak,
+-             self->summary_up_wait_ms, self->summary_up_first);
++             self->summary_up_wait_ms, self->summary_up_first,
++             self->summary_lift_rebases);
+ }
+ 
+ /* Verify/Identify SSM */
+@@ -634,6 +635,7 @@
+   self->summary_clear_ms = 0;
+   self->summary_up_wait_ms = 0;
+   self->summary_up_first = 0;
++  self->summary_lift_rebases = 0;
+   self->summary_ready_us = 0;
+   self->summary_down_us = 0;
+   self->summary_down_polls = 0;
+--- a/drivers/goodix53x5/goodix53x5-calibration.c
++++ b/drivers/goodix53x5/goodix53x5-calibration.c
+@@ -371,6 +371,53 @@
+   return TRUE;
+ }
+ 
++gboolean
++goodix_device_fdt_signed_extremes (const guint8 *baseline,
++                                  const guint8 *reading,
++                                  gsize         len,
++                                  gint         *out_pos,
++                                  gint         *out_neg)
++{
++  gint pos = 0;
++  gint neg = 0;
++
++  if (baseline == NULL || reading == NULL || len == 0 || (len % 2) != 0 ||
++      out_pos == NULL || out_neg == NULL)
++    return FALSE;
++
++  for (gsize i = 0; i < len; i += 2)
++    {
++      gint base = (baseline[i] | ((guint16) baseline[i + 1] << 8)) >> 1;
++      gint live = (reading[i] | ((guint16) reading[i + 1] << 8)) >> 1;
++
++      pos = MAX (pos, live - base);
++      neg = MIN (neg, live - base);
++    }
++
++  *out_pos = pos;
++  *out_neg = neg;
++  return TRUE;
++}
++
++/**
++ * goodix_device_classify_fdt_direction:
++ *
++ * TOUCH: most negative channel at or below -GOODIX_FDT_TOUCH_MIN_NEG and the
++ * positive side does not exceed it. LIFT: positive side dominant and at least
++ * GOODIX_FDT_LIFT_MIN_POS (the baseline held a finger that has since left).
++ * Everything else is AMBIGUOUS and is not a touch.
++ */
++GoodixFdtDirection
++goodix_device_classify_fdt_direction (gint pos,
++                                      gint neg)
++{
++  if (neg <= -GOODIX_FDT_TOUCH_MIN_NEG && pos <= -neg)
++    return GOODIX_FDT_DIRECTION_TOUCH;
++  if (pos >= GOODIX_FDT_LIFT_MIN_POS && pos > -neg)
++    return GOODIX_FDT_DIRECTION_LIFT;
++  return GOODIX_FDT_DIRECTION_AMBIGUOUS;
++}
++
+ /**
+  * goodix_device_generate_fdt_base:
+  *
+--- a/drivers/goodix53x5/goodix53x5-calibration.h
++++ b/drivers/goodix53x5/goodix53x5-calibration.h
+@@ -52,6 +52,24 @@
+                                           guint16      *out_max_delta,
+                                           guint        *out_changed_pairs);
+ 
++/* Direction of a manual-FDT trigger against the no-finger baseline. */
++typedef enum {
++  GOODIX_FDT_DIRECTION_TOUCH = 0,
++  GOODIX_FDT_DIRECTION_LIFT,
++  GOODIX_FDT_DIRECTION_AMBIGUOUS,
++} GoodixFdtDirection;
++
++/* Largest positive and most negative per-channel movement of reading against
++ * baseline on the protocol's >>1 scale. Returns FALSE for malformed input. */
++gboolean goodix_device_fdt_signed_extremes (const guint8 *baseline,
++                                            const guint8 *reading,
++                                            gsize         len,
++                                            gint         *out_pos,
++                                            gint         *out_neg);
++
++GoodixFdtDirection goodix_device_classify_fdt_direction (gint pos,
++                                                         gint neg);
++
+ void     goodix_device_generate_fdt_base (const guint8 *fdt_data,
+                                           gsize         len,
+                                           guint8       *fdt_base);
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -148,6 +148,24 @@
+ #define GOODIX_CLEAR_WINDOW_MAX_MS 3000
+ #define GOODIX_CLEAR_REJECT_ADOPT_AFTER 3
+ 
++/* Manual finger-down direction check (verify/identify and enroll). Touching
++ * the pad moves the FDT channels DOWN against an empty-pad baseline (measured
++ * -42..-49 on the >>1 scale, positive side 0). A baseline captured while the
++ * finger was still resting on the pad moves UP when that finger lifts
++ * (+45..+50, negative side 0), which used to be taken for a touch and burned
++ * the attempt on an empty frame. A trigger counts as a touch only when its
++ * most negative channel is at or below -GOODIX_FDT_TOUCH_MIN_NEG and the
++ * positive side does not exceed it. A positive-dominant trigger of at least
++ * GOODIX_FDT_LIFT_MIN_POS is a lift: re-baseline from the now-empty pad and
++ * keep waiting. Anything weaker is neither and is simply not a touch. At most
++ * GOODIX_LIFT_REBASE_MAX lifts are absorbed per finger wait, after which the
++ * old behaviour (any absolute trigger is a touch) applies; each re-baseline
++ * must be stable within GOODIX_LIFT_REBASE_MAX_POLLS polls or is abandoned. */
++#define GOODIX_FDT_TOUCH_MIN_NEG 20
++#define GOODIX_FDT_LIFT_MIN_POS 20
++#define GOODIX_LIFT_REBASE_MAX 3
++#define GOODIX_LIFT_REBASE_MAX_POLLS 30
++
+ /* After a non-matching or unusable attempt, wait at most this long for the
+  * finger to lift BEFORE reporting the result, so the caller's next claim does
+  * not start with the finger still down. If it is still down the result is
+@@ -341,6 +359,7 @@
+   gint       summary_clear_ms;
+   gint       summary_up_wait_ms;
+   gint       summary_up_first;
++  guint      summary_lift_rebases;
+ };
+ 
+ /* Open phases reached, in order, for the open summary line. */
+--- a/drivers/goodix53x5/goodix53x5-scan.c
++++ b/drivers/goodix53x5/goodix53x5-scan.c
+@@ -66,6 +66,11 @@
+   gint64 clear_start_us;
+   gint64 clear_dev_start_us;
+   gboolean clear_bypass;
++  /* Finger-down wait only: lift-direction re-baselines (see private.h). */
++  guint lift_rebases;
++  gboolean lift_rebasing;
++  guint rebase_polls;
++  guint rebase_stable;
+ } GoodixManualFdtPollState;
+ 
+ /* Finger-wait SSM (awaiting finger down) */
+@@ -975,6 +980,8 @@
+         guint changed_pairs;
+         gboolean down;
+         const guint8 *down_reading = NULL;
++        gint dir_pos = 0;
++        gint dir_neg = 0;
+ 
+         if (goodix_manual_fdt_check_cancelled (ssm, dev))
+           return;
+@@ -984,28 +991,122 @@
+                                               &changed_pairs))
+           return;
+ 
+-        /* Log-only: signed per-channel delta against the no-finger baseline,
+-         * overwritten each poll so the confirming poll's values remain. */
+-        if (self->log_summary && down_reading != NULL)
++        /* Re-baselining after a lift: wait for two stable readings of the
++         * now-empty pad (the same confirmation the reference clear-phase
++         * uses), then adopt the reading. Bounded; on timeout keep the old
++         * baseline and resume the normal wait. */
++        if (state->lift_rebasing)
+           {
+-            gint pos = 0;
+-            gint neg = 0;
+-
+-            for (gsize ch = 0; ch < GOODIX_FDT_BASE_LEN; ch += 2)
++            if (down_reading == NULL)
++              return;
++            state->rebase_polls++;
++            if (state->provisional_baseline == NULL)
+               {
+-                gint base = (self->fdt_data_tx_on[ch] |
+-                             ((guint16) self->fdt_data_tx_on[ch + 1] << 8)) >> 1;
+-                gint live = (down_reading[ch] |
+-                             ((guint16) down_reading[ch + 1] << 8)) >> 1;
++                state->provisional_baseline = g_memdup2 (down_reading,
++                                                          GOODIX_FDT_BASE_LEN);
++                state->rebase_stable = 1;
++              }
++            else
++              {
++                guint16 rebase_max;
++                guint rebase_pairs;
++
++                if (!goodix_device_measure_fdt_delta (state->provisional_baseline,
++                                                      down_reading,
++                                                      GOODIX_FDT_BASE_LEN,
++                                                      self->calib.delta_fdt,
++                                                      &rebase_max, &rebase_pairs))
++                  {
++                    fpi_ssm_mark_failed (ssm,
++                                         fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                                   "Malformed lift re-baseline comparison"));
++                    return;
++                  }
++                if (rebase_pairs == 0)
++                  state->rebase_stable++;
++                else
++                  {
++                    g_free (state->provisional_baseline);
++                    state->provisional_baseline = g_memdup2 (down_reading,
++                                                              GOODIX_FDT_BASE_LEN);
++                    state->rebase_stable = 1;
++                  }
++              }
+ 
+-                pos = MAX (pos, live - base);
+-                neg = MIN (neg, live - base);
++            if (state->rebase_stable >= GOODIX_MANUAL_FDT_CONFIRMATIONS)
++              {
++                goodix_manual_fdt_refresh_baseline (self, down_reading);
++                fp_dbg ("Finger-down baseline refreshed after a lift (%u/%u)",
++                        state->lift_rebases, GOODIX_LIFT_REBASE_MAX);
++                state->lift_rebasing = FALSE;
++                state->consecutive = 0;
++                g_clear_pointer (&state->provisional_baseline, g_free);
++              }
++            else if (state->rebase_polls >= GOODIX_LIFT_REBASE_MAX_POLLS)
++              {
++                fp_dbg ("Finger-down re-baseline did not settle within %u polls; "
++                        "keeping the previous baseline",
++                        GOODIX_LIFT_REBASE_MAX_POLLS);
++                state->lift_rebasing = FALSE;
++                state->consecutive = 0;
++                g_clear_pointer (&state->provisional_baseline, g_free);
+               }
+-            self->summary_dmax_pos = pos;
+-            self->summary_dmax_neg = neg;
++
++            if (goodix_manual_fdt_check_cancelled (ssm, dev))
++              return;
++            fpi_ssm_jump_to_state_delayed (ssm,
++                                           GOODIX_FINGER_WAIT_POLL_DOWN_REQUEST,
++                                           GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++            return;
++          }
++
++        /* Signed per-channel delta against the no-finger baseline (>>1 scale),
++         * overwritten each poll so the confirming poll's values remain in the
++         * attempt summary. It also decides the trigger's direction below. */
++        if (down_reading != NULL &&
++            goodix_device_fdt_signed_extremes (self->fdt_data_tx_on, down_reading,
++                                               GOODIX_FDT_BASE_LEN,
++                                               &dir_pos, &dir_neg))
++          {
++            self->summary_dmax_pos = dir_pos;
++            self->summary_dmax_neg = dir_neg;
+           }
+ 
+         down = changed_pairs > 0;
++
++        /* Only a touch-direction trigger is a finger-down. Once the lift
++         * budget is spent, any absolute trigger counts again (old behaviour). */
++        if (down && state->lift_rebases < GOODIX_LIFT_REBASE_MAX)
++          {
++            GoodixFdtDirection dir = goodix_device_classify_fdt_direction (dir_pos,
++                                                                           dir_neg);
++
++            if (dir == GOODIX_FDT_DIRECTION_LIFT)
++              {
++                /* The baseline was taken with a finger on the pad and that
++                 * finger has now left. Do not capture; re-baseline from the
++                 * empty pad and keep waiting for a real touch. */
++                state->lift_rebases++;
++                self->summary_lift_rebases++;
++                state->lift_rebasing = TRUE;
++                state->rebase_polls = 1;
++                state->rebase_stable = 1;
++                state->consecutive = 0;
++                g_clear_pointer (&state->provisional_baseline, g_free);
++                state->provisional_baseline = g_memdup2 (down_reading,
++                                                          GOODIX_FDT_BASE_LEN);
++                fp_dbg ("Finger-down trigger was a lift; re-baselining (%u/%u)",
++                        state->lift_rebases, GOODIX_LIFT_REBASE_MAX);
++                if (goodix_manual_fdt_check_cancelled (ssm, dev))
++                  return;
++                fpi_ssm_jump_to_state_delayed (ssm,
++                                               GOODIX_FINGER_WAIT_POLL_DOWN_REQUEST,
++                                               GOODIX_MANUAL_FDT_POLL_DELAY_MS);
++                return;
++              }
++            if (dir == GOODIX_FDT_DIRECTION_AMBIGUOUS)
++              down = FALSE;
++          }
+         goodix_manual_fdt_log_poll (state, "finger-down", down);
+         if (state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS)
+           {

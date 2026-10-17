@@ -30,6 +30,7 @@ OPEN_RECOVERY_PATCH = PATCH_DIR / "0016-goodix550c-drain-verify-psk-and-retry-tl
 PROTOCOL_PY = ROOT / "src" / "goodix550c" / "protocol.py"
 FINGER_PRESENT_PATCH = PATCH_DIR / "0017-goodix550c-refuse-finger-present-reference.patch"
 NON_CONTACT_GATE_PATCH = PATCH_DIR / "0018-goodix550c-verify-non-contact-gate.patch"
+TOUCH_DIRECTION_PATCH = PATCH_DIR / "0019-goodix550c-count-only-touch-direction-as-finger-down.patch"
 DRIVER_SERIES = PATCH_DIR / "driver-series"
 BUILD_SCRIPT = ROOT / "scripts" / "build_goodix550c_libfprint.sh"
 RUN_SCRIPT = ROOT / "scripts" / "run_goodix550c_open_close.sh"
@@ -385,6 +386,7 @@ def test_driver_patch_series_is_explicit_ordered_and_unique():
         OPEN_RECOVERY_PATCH.name,
         FINGER_PRESENT_PATCH.name,
         NON_CONTACT_GATE_PATCH.name,
+        TOUCH_DIRECTION_PATCH.name,
     ]
     assert len(entries) == len(set(entries))
 
@@ -778,7 +780,7 @@ def test_finger_guard_patches_follow_the_open_recovery_patch():
         line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     ]
-    assert entries[-2:] == [FINGER_PRESENT_PATCH.name, NON_CONTACT_GATE_PATCH.name]
+    assert entries[-3:-1] == [FINGER_PRESENT_PATCH.name, NON_CONTACT_GATE_PATCH.name]
     assert entries.index(FINGER_PRESENT_PATCH.name) > entries.index(LOG_SUMMARY_PATCH.name)
 
 
@@ -911,3 +913,76 @@ def test_non_contact_gate_precedes_scoring_and_reuses_the_enrollment_limit():
     assert "goodix_match_serialized_feature" not in added
     # 0.90, as in patch 0010.
     assert "#define GOODIX_ENROLL_NO_CONTACT_FRACTION 0.90" in added_lines(RETRY_REASON_PATCH)
+
+
+# --- 0019: only the touch direction counts as finger-down -------------------
+
+def test_touch_direction_patch_is_last_in_the_series():
+    entries = [
+        line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert entries[-1] == TOUCH_DIRECTION_PATCH.name
+    assert entries.index(TOUCH_DIRECTION_PATCH.name) > entries.index(NON_CONTACT_GATE_PATCH.name)
+
+
+def test_touch_direction_constants_are_named_and_bounded():
+    added = added_lines(TOUCH_DIRECTION_PATCH)
+
+    # Real touches measured -42..-49, lifts +45..+50: the floors sit well below both.
+    assert 10 <= int(_define(added, "GOODIX_FDT_TOUCH_MIN_NEG")) <= 40
+    assert 10 <= int(_define(added, "GOODIX_FDT_LIFT_MIN_POS")) <= 40
+    assert 1 <= int(_define(added, "GOODIX_LIFT_REBASE_MAX")) <= 5
+    assert 4 <= int(_define(added, "GOODIX_LIFT_REBASE_MAX_POLLS")) <= 50
+    assert "<= -GOODIX_FDT_TOUCH_MIN_NEG" in added
+    assert "pos <= -neg" in added  # positive side must not dominate a touch
+
+
+def test_lift_rebaseline_is_bounded_and_never_captures():
+    added = added_lines(TOUCH_DIRECTION_PATCH)
+
+    # Both loops compare against their named bound.
+    assert "state->lift_rebases < GOODIX_LIFT_REBASE_MAX" in added
+    assert "state->rebase_polls >= GOODIX_LIFT_REBASE_MAX_POLLS" in added
+    # A lift is counted, then returns to the poll request without completing the SSM.
+    lift = added.split("if (dir == GOODIX_FDT_DIRECTION_LIFT)", 1)[1]
+    lift = lift.split("if (dir == GOODIX_FDT_DIRECTION_AMBIGUOUS)", 1)[0]
+    assert "state->lift_rebases++" in lift
+    assert "self->summary_lift_rebases++" in lift
+    assert "GOODIX_FINGER_WAIT_POLL_DOWN_REQUEST" in lift
+    assert "return;" in lift
+    assert "fpi_ssm_mark_completed" not in lift
+    assert "GOODIX_FINGER_WAIT_POLL_DOWN_SETTLE" not in lift
+    # The re-baseline reuses the stable-reading confirmation and the baseline refresh.
+    assert "state->rebase_stable >= GOODIX_MANUAL_FDT_CONFIRMATIONS" in added
+    assert "goodix_manual_fdt_refresh_baseline (self, down_reading)" in added
+    # Nothing here stores a reference frame or changes the matcher/trigger threshold.
+    for forbidden in ("reference_image", "GOODIX_SIGFM_BEST_MIN", "delta_down =",
+                      "manual_fdt_poll_active", "suspend"):
+        assert forbidden not in added, forbidden
+    removed = "\n".join(
+        line for line in TOUCH_DIRECTION_PATCH.read_text(encoding="utf-8").splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    )
+    assert "GOODIX_SIGFM_BEST_MIN" not in removed
+    assert "self->calib.delta_down" not in removed  # trigger threshold untouched
+    # Direction is computed with the same >>1 scale as the 0015 dmax fields.
+    assert ">> 1" in added
+
+
+def test_touch_direction_summary_field_is_integer_only():
+    added = added_lines(TOUCH_DIRECTION_PATCH)
+
+    assert "lift_rebase=%u" in added
+    calls = _log_calls(added)
+    assert calls
+    for call in calls:
+        fmt = _format_of(call)
+        for spec in re.findall(r"%[-+ #0]*\d*(?:\.\d+)?[a-zA-Z]", fmt):
+            assert spec in ("%d", "%u"), (spec, call)
+        args = call[call.index(",") :] if "," in call else ""
+        for forbidden in ("reading", "baseline", "img12", "fdt_event_data", "psk"):
+            assert forbidden not in args, (forbidden, call)
+    # Reset per attempt next to the other summary fields, and no key/frame text.
+    assert "self->summary_lift_rebases = 0;" in added
+    assert not re.search(r"\bpsk\b|\botp\b", added, re.I)
