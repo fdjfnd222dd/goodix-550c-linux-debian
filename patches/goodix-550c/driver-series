@@ -13,3 +13,6 @@
 0013-goodix550c-keep-sensor-awake-between-enroll-stages.patch
 0014-goodix550c-stop-openssl-installing-an-atexit-handler.patch
 0015-goodix550c-log-attempt-summary.patch
+0016-goodix550c-drain-verify-psk-and-retry-tls-once.patch
+0017-goodix550c-refuse-finger-present-reference.patch
+0018-goodix550c-verify-non-contact-gate.patch

@@ -1,0 +1,524 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fingerprint Lab <noreply@example.invalid>
+Date: Sat, 17 Oct 2026 14:00:00 +0200
+Subject: [PATCH] goodix550c: drain the endpoint, verify the PSK, retry the handshake once
+
+A sensor left mid-session (fprintd killed, resume from sleep) can hold unread
+bytes in its IN endpoint or a half-open TLS session. The next open then fails
+the handshake with a provider cipher error, which reads exactly like a wrong
+key or a broken build. The documented manual cure was one read-only probe that
+drained the endpoint and woke the sensor. Do that inside the open sequence.
+
+  1. GOODIX_OPEN_DRAIN, right after the interface claim: read the IN endpoint
+     (at most 16 reads, 30 ms timeout each), discard the data, stop at the
+     first timeout, and count the bytes for the open summary line. This mirrors
+     the pre-existing-data loop of src/goodix550c/usb_probe.py.
+  2. GOODIX_OPEN_550C_PSK_HASH / _PSK_CHECK, after the OTP and before TLS:
+     read slot 0xbb020001 with the read-only 0xE4 command (the 16-byte payload
+     is byte-identical to READ_PSK_HASH_PAYLOAD in protocol.py), require the
+     exact reply layout the probe requires, and compare the 32-byte hash with
+     SHA-256 of the loaded PSK using CRYPTO_memcmp. A wrong key now fails the
+     open once, closed, as "PSK mismatch", with no retry. Neither hash is ever
+     logged; the PSK buffer is wiped on every path.
+  3. One handshake retry. If the TLS pump fails, or the sensor stays silent
+     during the handshake, the TLS context and receive buffer are freed and the
+     open resumes at DRAIN -> PING -> PSK_HASH -> PSK_CHECK -> TLS_INIT (the PSK
+     is read again). The budget is GOODIX_550C_TLS_MAX_RETRIES = 1; a second
+     failure fails the open exactly as before. There is no USB reset in the
+     retry and no loop.
+  4. The 0015 open summary now reports the real drain_bytes and tls_retry, and
+     a new phase "psk".
+
+0xE4 is not on the deny list (it reads, E0/E2 write); the list is unchanged and
+now carries a comment saying why. The disabled self-heal block stays #if 0.
+
+---
+
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -271,6 +271,14 @@
+   gboolean   log_summary;
+   gint64     summary_open_start_us;
+   gint       summary_open_phase;
++
++  /* Open-sequence recovery state (550c). Reset at USB_RESET, the first state of
++   * every open/reinit run. Counters feed the open summary line; none is secret. */
++  guint      open_drain_reads;        /* IN reads issued by the current drain */
++  gsize      open_drain_bytes;        /* stale bytes discarded, all drains */
++  guint      open_tls_retries;        /* TLS handshake retries used (max 1) */
++  gboolean   open_tls_retry_pending;  /* skip FW/reset/OTP; resume at PSK check */
++  FpiSsm    *open_recv_retry_ssm;     /* open SSM whose TLS_RECV may retry */
+   gint64     summary_ready_us;
+   gint64     summary_down_us;
+   guint      summary_down_polls;
+@@ -293,6 +301,7 @@
+   GOODIX_SUMMARY_PHASE_PING,
+   GOODIX_SUMMARY_PHASE_FW,
+   GOODIX_SUMMARY_PHASE_OTP,
++  GOODIX_SUMMARY_PHASE_PSK,
+   GOODIX_SUMMARY_PHASE_TLS,
+   GOODIX_SUMMARY_PHASE_DONE,
+ } GoodixSummaryPhase;
+--- a/drivers/goodix53x5/goodix53x5-safety.h
++++ b/drivers/goodix53x5/goodix53x5-safety.h
+@@ -37,6 +37,12 @@
+ #endif
+ }
+ 
++/*
++ * Deny list.  Note what is absent: 0xE4 (category 0xE, command 2) is the PSK
++ * slot *read* used to confirm the sensor holds the configured key.  It changes
++ * no sensor state and returns only the slot's SHA-256, so it is permitted; the
++ * neighbouring writes E0 and E2 stay denied below.
++ */
+ static inline gboolean
+ goodix_550c_command_is_persistent_mutation (guint8 category,
+                                              guint8 command)
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -41,16 +41,34 @@
+ #define GOODIX_550C_EXPECTED_FW "GF5288_GM168SEC_APP_13021"
+ #define GOODIX_550C_PSK_TEXT_MAX (GOODIX_PSK_LEN * 2 + 2)
+ 
++/* Stale-state recovery. A sensor left mid-session (killed fprintd, resume from
++ * sleep) can hold unread IN data or a half-open TLS session; the next open then
++ * fails the handshake with a provider cipher error. Drain the IN endpoint before
++ * talking, and allow exactly one handshake retry that repeats drain and ping.
++ * Neither step ever resets the USB device. */
++#define GOODIX_550C_DRAIN_MAX_READS   16
++#define GOODIX_550C_DRAIN_TIMEOUT_MS  30
++#define GOODIX_550C_DRAIN_CHUNK       512  /* >= any bulk packet: no overflow */
++#define GOODIX_550C_TLS_MAX_RETRIES   1
++
+ /* Open SSM — full device initialization */
+ typedef enum {
+   GOODIX_OPEN_USB_RESET = 0,
+   GOODIX_OPEN_CLAIM_INTERFACE,
++  /* Discard bytes a previous session left in the IN endpoint (bounded). */
++  GOODIX_OPEN_DRAIN,
+   GOODIX_OPEN_PING,
+   GOODIX_OPEN_READ_FW_VERSION,
+   GOODIX_OPEN_RESET,
+   GOODIX_OPEN_READ_CHIP_ID,
+   GOODIX_OPEN_READ_OTP,
+   GOODIX_OPEN_PARSE_OTP,
++  /* --- 550c only: confirm the sensor holds the configured PSK before any TLS
++   *     attempt (read-only 0xE4 slot read), so a wrong key is reported as such
++   *     instead of as a handshake failure. PARSE_OTP jumps in; PSK_CHECK jumps
++   *     on to TLS_INIT. --- */
++  GOODIX_OPEN_550C_PSK_HASH,
++  GOODIX_OPEN_550C_PSK_CHECK,
+   /* --- 550c TLS-PSK handshake (GOODIX_VARIANT_TLS_PSK only). Jumped in from
+    *     PARSE_OTP, rejoins the shared flow at UPLOAD_CONFIG. The 53x5 GTLS
+    *     path never enters these states. --- */
+@@ -254,6 +272,89 @@
+ }
+ 
+ /* ========================================================================
++ * Open recovery helpers: endpoint drain and one-shot handshake retry
++ * ======================================================================== */
++
++static void goodix_open_drain_submit (FpiSsm *ssm, FpDevice *dev);
++
++static void
++goodix_open_drain_cb (FpiUsbTransfer *transfer,
++                      FpDevice       *dev,
++                      gpointer        user_data,
++                      GError         *error)
++{
++  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
++  FpiSsm *ssm = transfer->ssm;
++
++  if (error != NULL)
++    {
++      /* The first quiet read ends the drain; anything else is a real fault. */
++      if (g_error_matches (error, G_USB_DEVICE_ERROR,
++                           G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          g_error_free (error);
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  self->open_drain_bytes += transfer->actual_length;
++  self->open_drain_reads++;
++  if (self->open_drain_reads >= GOODIX_550C_DRAIN_MAX_READS)
++    {
++      /* Still talking after the bound: stop reading and let the next
++       * command report whatever state the sensor is really in. */
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  goodix_open_drain_submit (ssm, dev);
++}
++
++static void
++goodix_open_drain_submit (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
++
++  transfer->ssm = ssm;
++  fpi_usb_transfer_fill_bulk (transfer, self->ep_in, GOODIX_550C_DRAIN_CHUNK);
++  fpi_usb_transfer_submit (transfer, GOODIX_550C_DRAIN_TIMEOUT_MS, NULL,
++                           goodix_open_drain_cb, NULL);
++}
++
++gboolean
++goodix_open_try_tls_retry (FpiSsm       *ssm,
++                           FpDevice     *dev,
++                           const GError *cause)
++{
++  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
++
++  if (self->variant != GOODIX_VARIANT_TLS_PSK ||
++      self->open_tls_retries >= GOODIX_550C_TLS_MAX_RETRIES)
++    return FALSE;
++
++  self->open_tls_retries++;
++  fp_warn ("TLS handshake did not complete (%s); retrying once after "
++           "draining the sensor", cause != NULL ? cause->message : "timeout");
++
++  /* Nothing from the failed attempt survives: the TLS context holds the PSK
++   * and session keys, and the receive buffer may hold handshake bytes. The
++   * PSK is read again from its source by the TLS_INIT that follows. */
++  g_clear_pointer (&self->tls, goodix_tls_free);
++  self->tls_handshake_done = FALSE;
++  goodix_proto_rx_reset (&self->rx);
++  self->open_recv_retry_ssm = NULL;
++  self->open_tls_retry_pending = TRUE;
++
++  /* DRAIN -> PING -> PSK_HASH -> PSK_CHECK -> TLS_INIT. No USB reset. */
++  fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_DRAIN);
++  return TRUE;
++}
++
++/* ========================================================================
+  * Open SSM — full device initialization
+  * ======================================================================== */
+ 
+@@ -265,7 +366,7 @@
+   GoodixOpenState state = fpi_ssm_get_cur_state (ssm);
+ 
+   /* Log-only: remember how far this open got, for the summary line. */
+-  if (state <= GOODIX_OPEN_CLAIM_INTERFACE)
++  if (state <= GOODIX_OPEN_DRAIN)
+     self->summary_open_phase = GOODIX_SUMMARY_PHASE_CLAIM;
+   else if (state == GOODIX_OPEN_PING)
+     self->summary_open_phase = GOODIX_SUMMARY_PHASE_PING;
+@@ -273,6 +374,8 @@
+     self->summary_open_phase = GOODIX_SUMMARY_PHASE_FW;
+   else if (state <= GOODIX_OPEN_PARSE_OTP)
+     self->summary_open_phase = GOODIX_SUMMARY_PHASE_OTP;
++  else if (state <= GOODIX_OPEN_550C_PSK_CHECK)
++    self->summary_open_phase = GOODIX_SUMMARY_PHASE_PSK;
+   else
+     self->summary_open_phase = GOODIX_SUMMARY_PHASE_TLS;
+ 
+@@ -282,6 +385,14 @@
+       {
+         GError *error = NULL;
+ 
++        /* First state of every open and reinit run: start the recovery
++         * budget afresh. */
++        self->open_drain_reads = 0;
++        self->open_drain_bytes = 0;
++        self->open_tls_retries = 0;
++        self->open_tls_retry_pending = FALSE;
++        self->open_recv_retry_ssm = NULL;
++
+         if (!goodix_550c_volatile_init_allowed ())
+           {
+             fpi_ssm_mark_failed (
+@@ -321,11 +432,24 @@
+       }
+       break;
+ 
++    case GOODIX_OPEN_DRAIN:
++      self->open_drain_reads = 0;
++      goodix_open_drain_submit (ssm, dev);
++      break;
++
+     case GOODIX_OPEN_PING:
+       goodix_cmd_ping (ssm, dev);
+       break;
+ 
+     case GOODIX_OPEN_READ_FW_VERSION:
++      /* A handshake retry already passed firmware, reset, chip ID and OTP;
++       * after drain and ping it resumes at the PSK check. */
++      if (self->open_tls_retry_pending)
++        {
++          self->open_tls_retry_pending = FALSE;
++          fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_550C_PSK_HASH);
++          break;
++        }
+       goodix_cmd_read_fw_version (ssm, dev);
+       break;
+ 
+@@ -426,12 +550,68 @@
+ 
+         /* 550c uses standard TLS-PSK instead of the 53x5 PSK-hash/GTLS path. */
+         if (self->variant == GOODIX_VARIANT_TLS_PSK)
+-          fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_TLS_INIT);
++          fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_550C_PSK_HASH);
+         else
+           fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_READ_PSK_HASH);
+       }
+       break;
+ 
++    case GOODIX_OPEN_550C_PSK_HASH:
++      /* preset_psk_read (0xE4): length 32, offset 0, slot 0xbb020001, 0.
++       * Read-only; the payload is byte-identical to READ_PSK_HASH_PAYLOAD in
++       * src/goodix550c/protocol.py. */
++      goodix_cmd_preset_psk_read (ssm, dev, GOODIX_PSK_HASH_SLOT,
++                                  GOODIX_PSK_HASH_LEN, 0);
++      break;
++
++    case GOODIX_OPEN_550C_PSK_CHECK:
++      {
++        guint8 psk[GOODIX_PSK_LEN];
++        g_autoptr(GError) error = NULL;
++        const guint8 *pl;
++        gsize pl_len;
++        GoodixPskHashResult hash_result;
++
++        if (!goodix_parse_reply_exact (dev, 0xE, 0x2, &pl, &pl_len, &error))
++          {
++            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
++            return;
++          }
++
++        if (!goodix_550c_load_psk (psk, &error))
++          {
++            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
++            return;
++          }
++
++        hash_result = goodix_psk_hash_check_reply (psk, GOODIX_PSK_LEN,
++                                                   pl, pl_len);
++        OPENSSL_cleanse (psk, sizeof (psk));
++
++        if (hash_result == GOODIX_PSK_HASH_BAD_REPLY)
++          {
++            fpi_ssm_mark_failed (
++              ssm,
++              fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                        "Unexpected PSK slot reply from sensor"));
++            return;
++          }
++
++        if (hash_result != GOODIX_PSK_HASH_MATCH)
++          {
++            /* No retry: a different key cannot be fixed by trying again. */
++            fpi_ssm_mark_failed (
++              ssm,
++              fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                        "PSK mismatch: the configured PSK is "
++                                        "not the one stored in the sensor"));
++            return;
++          }
++
++        fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_TLS_INIT);
++      }
++      break;
++
+     case GOODIX_OPEN_TLS_INIT:
+       {
+         guint8 psk[GOODIX_PSK_LEN];
+@@ -472,6 +652,9 @@
+         gboolean done = FALSE;
+         g_autoptr(GError) error = NULL;
+ 
++        /* A pack arrived, so the receive-timeout retry hook is spent. */
++        self->open_recv_retry_ssm = NULL;
++
+         /* The device's handshake bytes are the payload of the last 0xB0 pack. */
+         if (!goodix_proto_rx_pack (&self->rx, &flag, &pl, &pl_len) ||
+             flag != GOODIX_PACK_FLAG_TLS)
+@@ -485,6 +668,8 @@
+         if (!goodix_tls_handshake_pump (self->tls, pl, pl_len,
+                                         &out, &out_len, &done, &error))
+           {
++            if (goodix_open_try_tls_retry (ssm, dev, error))
++              return;
+             fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+             return;
+           }
+@@ -513,7 +698,9 @@
+       break;
+ 
+     case GOODIX_OPEN_TLS_RECV:
+-      /* Receive the next 0xB0 handshake pack from the device. */
++      /* Receive the next 0xB0 handshake pack from the device. A timeout here
++       * is retried once by goodix_rx_cb through this hook. */
++      self->open_recv_retry_ssm = ssm;
+       goodix_recv_start (ssm, dev, GOODIX_DATA_TIMEOUT, NULL);
+       break;
+ 
+@@ -523,6 +710,7 @@
+ 
+     case GOODIX_OPEN_TLS_ESTABLISHED:
+       /* tls_successfully_established (cat 0xD / cmd 2), no data reply. */
++      self->open_recv_retry_ssm = NULL;
+       fp_info ("TLS-PSK handshake completed");
+       goodix_run_cmd (ssm, dev, 0xD, 0x2,
+                       (const guint8 *) "\x00\x00", 2, FALSE);
+@@ -1428,6 +1616,7 @@
+     case GOODIX_SUMMARY_PHASE_PING: return "ping";
+     case GOODIX_SUMMARY_PHASE_FW: return "fw";
+     case GOODIX_SUMMARY_PHASE_OTP: return "otp";
++    case GOODIX_SUMMARY_PHASE_PSK: return "psk";
+     case GOODIX_SUMMARY_PHASE_TLS: return "tls";
+     default: return "done";
+     }
+@@ -1442,11 +1631,13 @@
+   if (!self->log_summary)
+     return;
+ 
+-  g_message ("goodix550c open: result=%s ms=%d phase=%s drain_bytes=0 tls_retry=0",
++  g_message ("goodix550c open: result=%s ms=%d phase=%s drain_bytes=%d tls_retry=%u",
+              ok ? "ok" : "fail",
+              (int) ((g_get_monotonic_time () - self->summary_open_start_us) / 1000),
+              goodix_summary_phase_name (ok ? GOODIX_SUMMARY_PHASE_DONE :
+-                                        self->summary_open_phase));
++                                        self->summary_open_phase),
++             (int) MIN (self->open_drain_bytes, (gsize) G_MAXINT),
++             self->open_tls_retries);
+ }
+ 
+ static void
+@@ -1455,6 +1646,7 @@
+   FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+ 
+   self->task_ssm = NULL;
++  self->open_recv_retry_ssm = NULL;
+   goodix_log_open_summary (self, error == NULL);
+ 
+   /* The experimental polling path needs the two-sample-stable raw baseline
+--- a/drivers/goodix53x5/goodix53x5-session.h
++++ b/drivers/goodix53x5/goodix53x5-session.h
+@@ -53,3 +53,13 @@
+  */
+ void goodix_session_suspend (FpDevice *dev);
+ void goodix_session_resume (FpDevice *dev);
++
++/**
++ * One-shot recovery for a 550c handshake that failed or timed out: free the
++ * TLS context and receive buffer, then rewind the open SSM @ssm to the drain
++ * state. Returns TRUE if the retry was taken (the caller must not fail @ssm),
++ * FALSE once the retry budget is spent (the caller fails the open as before).
++ */
++gboolean goodix_open_try_tls_retry (FpiSsm       *ssm,
++                                    FpDevice     *dev,
++                                    const GError *cause);
+--- a/drivers/goodix53x5/goodix53x5-tls.c
++++ b/drivers/goodix53x5/goodix53x5-tls.c
+@@ -23,6 +23,7 @@
+ #include <openssl/crypto.h>
+ #include <openssl/ssl.h>
+ #include <openssl/err.h>
++#include <openssl/evp.h>
+ #include <string.h>
+ 
+ #define GOODIX_TLS_PSK_MAX 64
+@@ -310,3 +311,38 @@
+ {
+   return tls != NULL && SSL_is_init_finished (tls->ssl);
+ }
++
++GoodixPskHashResult
++goodix_psk_hash_check_reply (const guint8 *psk,
++                             gsize         psk_len,
++                             const guint8 *reply,
++                             gsize         reply_len)
++{
++  guint8 expected[GOODIX_PSK_HASH_LEN];
++  unsigned int expected_len = 0;
++  guint32 slot, length;
++  int diff;
++
++  /* Exact layout, as src/goodix550c/usb_probe.py::_decode_psk_read_reply. */
++  if (psk == NULL || psk_len == 0 || reply == NULL ||
++      reply_len != 9 + GOODIX_PSK_HASH_LEN || reply[0] != 0x00)
++    return GOODIX_PSK_HASH_BAD_REPLY;
++
++  slot = (guint32) reply[1] | ((guint32) reply[2] << 8) |
++         ((guint32) reply[3] << 16) | ((guint32) reply[4] << 24);
++  length = (guint32) reply[5] | ((guint32) reply[6] << 8) |
++           ((guint32) reply[7] << 16) | ((guint32) reply[8] << 24);
++  if (slot != GOODIX_PSK_HASH_SLOT || length != GOODIX_PSK_HASH_LEN)
++    return GOODIX_PSK_HASH_BAD_REPLY;
++
++  if (EVP_Digest (psk, psk_len, expected, &expected_len, EVP_sha256 (), NULL) != 1 ||
++      expected_len != GOODIX_PSK_HASH_LEN)
++    {
++      OPENSSL_cleanse (expected, sizeof (expected));
++      return GOODIX_PSK_HASH_BAD_REPLY;
++    }
++
++  diff = CRYPTO_memcmp (expected, reply + 9, GOODIX_PSK_HASH_LEN);
++  OPENSSL_cleanse (expected, sizeof (expected));
++  return diff == 0 ? GOODIX_PSK_HASH_MATCH : GOODIX_PSK_HASH_MISMATCH;
++}
+--- a/drivers/goodix53x5/goodix53x5-tls.h
++++ b/drivers/goodix53x5/goodix53x5-tls.h
+@@ -73,3 +73,26 @@
+ 
+ /* TRUE once the handshake has finished. */
+ gboolean   goodix_tls_is_established (GoodixTls *tls);
++
++/*
++ * Result of comparing a device PSK-slot read against the configured PSK.
++ * The reply is the payload of the 0xE4 (preset_psk_read) response for slot
++ * GOODIX_PSK_HASH_SLOT: status(1) | slot(4 LE) | length(4 LE) | SHA-256(PSK).
++ * Any deviation from that exact layout is BAD_REPLY, never a match.
++ */
++#define GOODIX_PSK_HASH_SLOT 0xbb020001u
++#define GOODIX_PSK_HASH_LEN  32
++
++typedef enum
++{
++  GOODIX_PSK_HASH_MATCH = 0,
++  GOODIX_PSK_HASH_BAD_REPLY,
++  GOODIX_PSK_HASH_MISMATCH,
++} GoodixPskHashResult;
++
++/* Constant-time check of @reply against SHA-256 of @psk. Neither hash is ever
++ * returned, logged or left on the stack. */
++GoodixPskHashResult goodix_psk_hash_check_reply (const guint8 *psk,
++                                                 gsize         psk_len,
++                                                 const guint8 *reply,
++                                                 gsize         reply_len);
+--- a/drivers/goodix53x5/goodix53x5-transport.c
++++ b/drivers/goodix53x5/goodix53x5-transport.c
+@@ -23,6 +23,7 @@
+ #include "goodix53x5-private.h"
+ #include "goodix53x5-safety.h"
+ #include "goodix53x5-transport.h"
++#include "goodix53x5-session.h"
+ 
+ #include <string.h>
+ 
+@@ -390,6 +391,18 @@
+ 
+       self->blocking_ssm = NULL;
+ 
++      /* A silent sensor during the 550c handshake gets the same single retry
++       * as a failed handshake; the hook is armed only by the open SSM's
++       * TLS_RECV state. */
++      if (!self->suspend_pending && transfer->ssm == self->open_recv_retry_ssm &&
++          g_error_matches (error, G_USB_DEVICE_ERROR,
++                           G_USB_DEVICE_ERROR_TIMED_OUT) &&
++          goodix_open_try_tls_retry (transfer->ssm, dev, error))
++        {
++          g_clear_error (&error);
++          return;
++        }
++
+       if (self->suspend_pending)
+         {
+           /* Non-cancellation error during suspend — report it and fail SSM */

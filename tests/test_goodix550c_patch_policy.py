@@ -26,6 +26,10 @@ RETRY_BUDGET_PATCH = PATCH_DIR / "0012-goodix550c-size-reference-retry-to-blacko
 KEEP_AWAKE_PATCH = PATCH_DIR / "0013-goodix550c-keep-sensor-awake-between-enroll-stages.patch"
 NO_ATEXIT_PATCH = PATCH_DIR / "0014-goodix550c-stop-openssl-installing-an-atexit-handler.patch"
 LOG_SUMMARY_PATCH = PATCH_DIR / "0015-goodix550c-log-attempt-summary.patch"
+OPEN_RECOVERY_PATCH = PATCH_DIR / "0016-goodix550c-drain-verify-psk-and-retry-tls-once.patch"
+PROTOCOL_PY = ROOT / "src" / "goodix550c" / "protocol.py"
+FINGER_PRESENT_PATCH = PATCH_DIR / "0017-goodix550c-refuse-finger-present-reference.patch"
+NON_CONTACT_GATE_PATCH = PATCH_DIR / "0018-goodix550c-verify-non-contact-gate.patch"
 DRIVER_SERIES = PATCH_DIR / "driver-series"
 BUILD_SCRIPT = ROOT / "scripts" / "build_goodix550c_libfprint.sh"
 RUN_SCRIPT = ROOT / "scripts" / "run_goodix550c_open_close.sh"
@@ -378,6 +382,9 @@ def test_driver_patch_series_is_explicit_ordered_and_unique():
         KEEP_AWAKE_PATCH.name,
         NO_ATEXIT_PATCH.name,
         LOG_SUMMARY_PATCH.name,
+        OPEN_RECOVERY_PATCH.name,
+        FINGER_PRESENT_PATCH.name,
+        NON_CONTACT_GATE_PATCH.name,
     ]
     assert len(entries) == len(set(entries))
 
@@ -404,6 +411,7 @@ def test_summary_lines_carry_only_integers_and_fixed_literals():
     assert len(calls) == 2
     attempt_call, open_call = sorted(calls, key=lambda c: "open:" in c)
 
+    # 0015 introduced the line with constants; 0016 fills the two counters.
     assert "goodix550c open: result=%s ms=%d phase=%s drain_bytes=0 tls_retry=0" in open_call
     assert "goodix550c attempt: action=%s" in attempt_call
     for key in (
@@ -560,3 +568,346 @@ def test_prepare_only_pipeline_applies_all_patches_without_hardware():
     assert "Goodix 550c fail-closed policy audit passed" in result.stdout
     assert "Prepared fail-closed source tree" in result.stdout
     assert "meson setup" not in result.stdout
+
+
+# --- 0016: drain, verify the PSK, retry the handshake once -------------------
+
+def _removed_lines(path: Path) -> str:
+    return "\n".join(
+        line[1:]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    )
+
+
+def _recovery_added() -> str:
+    return added_lines(OPEN_RECOVERY_PATCH)
+
+
+def test_recovery_patch_is_listed_after_the_summary_patch():
+    entries = [
+        line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert entries.index(OPEN_RECOVERY_PATCH.name) == entries.index(LOG_SUMMARY_PATCH.name) + 1
+
+
+def test_recovery_patch_fills_the_open_summary_counters():
+    added = _recovery_added()
+    removed = _removed_lines(OPEN_RECOVERY_PATCH)
+
+    assert "drain_bytes=0 tls_retry=0" in removed
+    assert "drain_bytes=%d tls_retry=%u" in added
+    assert "self->open_drain_bytes" in added and "self->open_tls_retries" in added
+    assert 'case GOODIX_SUMMARY_PHASE_PSK: return "psk";' in added
+
+
+def test_tls_retry_budget_is_exactly_one_and_never_resets_usb():
+    added = _recovery_added()
+
+    assert re.search(r"#define GOODIX_550C_TLS_MAX_RETRIES\s+1\b", added)
+    assert "self->open_tls_retries >= GOODIX_550C_TLS_MAX_RETRIES" in added
+    assert "self->open_tls_retries++" in added
+    # Counter restarts only at USB_RESET, the first state of an open/reinit run.
+    assert added.count("self->open_tls_retries = 0;") == 1
+    # The retry rewinds to DRAIN; it never reaches the USB reset or the claim.
+    retry = re.search(r"goodix_open_try_tls_retry \(FpiSsm.*?\n}\n", added, re.S).group(0)
+    assert "fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_DRAIN)" in retry
+    assert "GOODIX_OPEN_USB_RESET" not in retry and "g_usb_device_reset" not in retry
+    assert "g_clear_pointer (&self->tls, goodix_tls_free)" in retry
+    assert "goodix_proto_rx_reset (&self->rx)" in retry
+    assert "g_usb_device_reset" not in added
+
+
+def test_a_pump_failure_and_a_handshake_timeout_both_take_the_retry():
+    added = _recovery_added()
+
+    assert "if (goodix_open_try_tls_retry (ssm, dev, error))" in added
+    # The timeout path is armed only by TLS_RECV and clears on every exit.
+    assert "self->open_recv_retry_ssm = ssm;" in added
+    assert "transfer->ssm == self->open_recv_retry_ssm" in added
+    assert "G_USB_DEVICE_ERROR_TIMED_OUT" in added
+    assert added.count("self->open_recv_retry_ssm = NULL;") >= 4
+    # The retry resumes at the PSK check, skipping reset/firmware/OTP.
+    assert "self->open_tls_retry_pending" in added
+    assert "fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_550C_PSK_HASH)" in added
+
+
+def test_endpoint_drain_is_bounded_discards_data_and_stops_at_first_timeout():
+    added = _recovery_added()
+
+    assert re.search(r"#define GOODIX_550C_DRAIN_MAX_READS\s+16\b", added)
+    assert re.search(r"#define GOODIX_550C_DRAIN_TIMEOUT_MS\s+30\b", added)
+    assert "self->open_drain_reads >= GOODIX_550C_DRAIN_MAX_READS" in added
+    cb = re.search(r"goodix_open_drain_cb \(FpiUsbTransfer.*?\n}\n", added, re.S).group(0)
+    assert "G_USB_DEVICE_ERROR_TIMED_OUT" in cb
+    assert "fpi_ssm_next_state" in cb
+    # Data is counted, never inspected, stored or logged.
+    assert "self->open_drain_bytes += transfer->actual_length" in cb
+    assert "transfer->buffer" not in cb
+    assert "fp_dbg" not in cb and "fp_info" not in cb and "g_message" not in cb
+    # Drain sits right after the claim and before ping.
+    assert re.search(r"\n   GOODIX_OPEN_CLAIM_INTERFACE,\n(?:\+.*\n)*?\+  GOODIX_OPEN_DRAIN,\n"
+                     r"   GOODIX_OPEN_PING,", OPEN_RECOVERY_PATCH.read_text(encoding="utf-8"))
+
+
+def _protocol_py_psk_read_payload() -> bytes:
+    text = PROTOCOL_PY.read_text(encoding="utf-8")
+    slot = int(re.search(r"PSK_HASH_SLOT = (0x[0-9A-Fa-f]+)", text).group(1), 16)
+    length = int(re.search(r"READ_PSK_HASH_PAYLOAD = _psk_read_payload\((\d+), PSK_HASH_SLOT\)", text).group(1))
+    return (length.to_bytes(4, "little") + (0).to_bytes(4, "little")
+            + slot.to_bytes(4, "little") + (0).to_bytes(4, "little"))
+
+
+def test_psk_hash_read_is_the_probe_payload_and_the_deny_list_is_unchanged():
+    added = _recovery_added()
+    payload = _protocol_py_psk_read_payload()
+
+    assert payload.hex() == "2000000000000000010002bb00000000"
+    # Same slot and length constants as protocol.py; native test checks the bytes.
+    assert "#define GOODIX_PSK_HASH_SLOT 0xbb020001u" in added
+    assert "#define GOODIX_PSK_HASH_LEN  32" in added
+    assert "goodix_cmd_preset_psk_read (ssm, dev, GOODIX_PSK_HASH_SLOT," in added
+    native = (ROOT / "tests" / "native" / "test_goodix550c_fdt_down.c").read_text(encoding="utf-8")
+    body = re.search(r"test_psk_hash_read_payload \(void\).*?\n}\n", native, re.S).group(0)
+    table = re.search(r"expected\[16\] = \{(.*?)\};", body, re.S).group(1)
+    assert bytes(int(t, 16) for t in re.findall(r"0x[0-9a-f]{2}", table)) == payload
+
+    # Deny list: this patch touches no predicate line; 0xE4 is only explained.
+    changed = [
+        line for line in OPEN_RECOVERY_PATCH.read_text(encoding="utf-8").splitlines()
+        if line[:1] in "+-" and not line.startswith(("+++", "---")) and "category ==" in line
+    ]
+    assert changed == []
+    assert "0xE4 (category 0xE, command 2) is the PSK" in added
+    assert "E0 and E2 stay denied" in added
+
+
+def test_psk_check_fails_closed_without_retry_and_never_logs_hashes():
+    added = _recovery_added()
+    check = re.search(r"case GOODIX_OPEN_550C_PSK_CHECK:.*?\n      break;", added, re.S).group(0)
+
+    assert "goodix_parse_reply_exact (dev, 0xE, 0x2" in check
+    assert "goodix_psk_hash_check_reply (psk, GOODIX_PSK_LEN" in check
+    assert '"PSK mismatch' in check
+    assert "GOODIX_PSK_HASH_BAD_REPLY" in check
+    assert "goodix_open_try_tls_retry" not in check  # a wrong key is not retried
+    # Wiped before any branch can leave, and loaded fresh before the compare.
+    assert check.index("goodix_550c_load_psk (psk") < check.index("goodix_psk_hash_check_reply")
+    assert check.index("OPENSSL_cleanse (psk, sizeof (psk))") < check.index("GOODIX_PSK_HASH_BAD_REPLY")
+    assert "fp_dbg" not in check and "fp_info" not in check and "g_message" not in check
+
+    helper = re.search(r"goodix_psk_hash_check_reply \(const guint8 \*psk,.*?\n}\n", added, re.S).group(0)
+    assert "CRYPTO_memcmp (expected, reply + 9, GOODIX_PSK_HASH_LEN)" in helper
+    assert "memcmp (expected" not in helper.replace("CRYPTO_memcmp", "")
+    assert helper.count("OPENSSL_cleanse (expected") == 2  # both exits after hashing
+
+
+def test_recovery_patch_formats_no_hash_or_key_material():
+    added = _recovery_added()
+    calls = re.findall(
+        r"(?:fp_dbg|fp_info|fp_warn|fp_err|g_message|g_warning|g_debug|"
+        r"fpi_device_error_new_msg) \(.*?\);", added, re.S)
+    assert len(calls) >= 3
+    for call in calls:
+        # Arguments after the format string: only the error cause or counters.
+        args = call[call.rindex('"') + 1:]
+        for forbidden in ("psk", "hash", "expected", "reply", "payload", "->tls", "->rx", "otp"):
+            assert forbidden not in args.lower(), (forbidden, call)
+        assert not re.search(r"%[xXp]", call), call
+    # "PSK mismatch" is a fixed literal with no arguments at all.
+    mismatch = [c for c in calls if "PSK mismatch" in c]
+    assert len(mismatch) == 1 and "%" not in mismatch[0]
+
+
+def test_secrets_are_wiped_on_every_new_failure_path():
+    added = _recovery_added()
+
+    # The local key buffer used by the check is cleansed straight after use.
+    assert "OPENSSL_cleanse (psk, sizeof (psk));" in added
+    # The retry drops the TLS context (which owns the PSK) before rewinding.
+    retry = re.search(r"goodix_open_try_tls_retry \(FpiSsm.*?\n}\n", added, re.S).group(0)
+    assert retry.index("g_clear_pointer (&self->tls, goodix_tls_free)") < retry.index(
+        "fpi_ssm_jump_to_state")
+    # The loader still cleanses its own buffer on failure (unchanged by 0016).
+    assert "goodix_550c_load_psk" in added
+    assert "OPENSSL_cleanse (out, GOODIX_PSK_LEN)" not in added
+
+
+def test_self_heal_stays_disabled_and_untouched_by_the_recovery_patch():
+    text = OPEN_RECOVERY_PATCH.read_text(encoding="utf-8")
+
+    assert "GOODIX_HEAL_" not in added_lines(OPEN_RECOVERY_PATCH)
+    assert "GOODIX_HEAL_" not in _removed_lines(OPEN_RECOVERY_PATCH)
+    # Not a single hunk edits inside the #if 0 self-heal block: its context
+    # lines never mention it and the patch never adds or removes an #if 0.
+    assert "#if 0" not in added_lines(OPEN_RECOVERY_PATCH)
+    assert "#if 0" not in _removed_lines(OPEN_RECOVERY_PATCH)
+    assert "goodix_550c_self_heal" not in text.replace("self-heal block stays", "")
+
+
+def test_recovery_native_tests_are_wired_into_the_build():
+    script = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+    assert "tests/native/test_goodix550c_psk_hash.c" in script
+    assert '"$BUILD_DIR/test-goodix550c-psk-hash"' in script
+    native = (ROOT / "tests" / "native" / "test_goodix550c_psk_hash.c").read_text(encoding="utf-8")
+    assert "GOODIX_PSK_HASH_MISMATCH" in native and "GOODIX_PSK_HASH_BAD_REPLY" in native
+
+
+# --- 0017/0018: finger-present reference, finger-up before report, no-contact gate
+
+def _define(added: str, name: str) -> str:
+    match = re.search(rf"#define {name}\s+(\S+)", added)
+    assert match, name
+    return match.group(1)
+
+
+def _log_calls(added: str) -> list[str]:
+    return re.findall(r"(?:fp_dbg|g_message|fp_warn|fp_info) \(.*?\);", added, re.S)
+
+
+def _format_of(call: str) -> str:
+    head = call[call.index("(") + 1:]
+    parts = re.findall(r'"((?:[^"\\]|\\.)*)"', head.split(",")[0] if "," in head else head)
+    return "".join(parts)
+
+
+def test_finger_guard_patches_follow_the_open_recovery_patch():
+    entries = [
+        line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert entries[-2:] == [FINGER_PRESENT_PATCH.name, NON_CONTACT_GATE_PATCH.name]
+    assert entries.index(FINGER_PRESENT_PATCH.name) > entries.index(LOG_SUMMARY_PATCH.name)
+
+
+def test_finger_guard_constants_are_named_and_bounded():
+    added = added_lines(FINGER_PRESENT_PATCH)
+
+    mean_max = int(_define(added, "GOODIX_REF_FINGER_MEAN_MAX"))
+    assert 1000 <= mean_max <= 2300  # between finger-covered (<1700) and empty (~2350)
+    assert mean_max > 200  # above GOODIX_REFERENCE_MIN_MEAN, the no-signal gate
+    assert int(_define(added, "GOODIX_REFERENCE_FINGER_MAX_RETRIES")) <= 60  # 0012 budget
+    assert 1 <= int(_define(added, "GOODIX_CLEAR_CONSECUTIVE_POLLS")) <= 5
+    assert int(_define(added, "GOODIX_CLEAR_WINDOW_MAX_MS")) <= 3000
+    assert 1 <= int(_define(added, "GOODIX_CLEAR_REJECT_ADOPT_AFTER")) <= 5
+    assert int(_define(added, "GOODIX_RESULT_FINGER_UP_WAIT_MS")) <= 1500
+    # Every wait is compared against its named bound, not a literal.
+    assert "GOODIX_CLEAR_WINDOW_MAX_MS" in added.split("#define GOODIX_CLEAR_WINDOW_MAX_MS", 1)[1]
+    assert re.search(r">=\s*\n?\s*GOODIX_RESULT_FINGER_UP_WAIT_MS", added)
+
+
+def test_finger_covered_reference_is_never_stored_and_retries_within_budget():
+    added = added_lines(FINGER_PRESENT_PATCH)
+    text = "\n".join(  # added plus context: the store itself is existing code
+        line[1:] for line in FINGER_PRESENT_PATCH.read_text(encoding="utf-8").splitlines()
+        if line[:1] in "+ " and not line.startswith("+++")
+    )
+
+    check = text.index("if (goodix_reference_frame_has_finger (img12))")
+    store = text.index("g_clear_pointer (&self->reference_image, g_free);", check)
+    block = text[check:store]
+    assert "self->reference_retries < GOODIX_REFERENCE_MAX_RETRIES" in block
+    assert "self->reference_finger_retries < GOODIX_REFERENCE_FINGER_MAX_RETRIES" in block
+    assert "self->reference_image =" not in block
+    # Exhaustion ends the attempt (retry or failure); it never falls through to the store.
+    assert block.count("return;") >= 3
+    assert "FP_DEVICE_RETRY_REMOVE_FINGER" in added
+    assert "GOODIX_SUMMARY_RESULT_RETRY_FINGER_PRESENT" in added
+    assert '"retry:finger-present"' in added
+    # The no-signal gate is existing code ahead of this hunk and is not removed.
+    assert "goodix_reference_frame_has_signal" not in _removed_lines(FINGER_PRESENT_PATCH)
+
+
+def test_clear_window_judges_against_the_empty_baseline_with_the_down_threshold():
+    added = added_lines(FINGER_PRESENT_PATCH)
+
+    assert "self->calib.delta_down" in added
+    assert "self->fdt_data_tx_on" in added
+    assert "state->clear_streak >= GOODIX_CLEAR_CONSECUTIVE_POLLS" in added
+    # Only the pre-reference phase of verify/identify is gated.
+    assert "!state->reference_post_capture && goodix_auth_action_active (dev)" in added
+    # Drift cannot lock the finger out forever.
+    assert "self->clear_reject_streak + 1 >= GOODIX_CLEAR_REJECT_ADOPT_AFTER" in added
+
+
+def test_result_is_held_for_finger_up_only_for_a_bounded_time():
+    added = added_lines(FINGER_PRESENT_PATCH)
+    removed = _removed_lines(FINGER_PRESENT_PATCH)
+
+    assert "self->defer_result_report = TRUE;" in added
+    assert "goodix_550c_manual_fdt_poll_allowed ()" in added
+    assert "goodix_flush_pending_result_report (dev);" in added
+    assert "(g_get_monotonic_time () - self->up_wait_start_us) / 1000 >=" in added
+    # The hold-back adds no loop or sleep of its own: it rides the existing,
+    # budgeted finger-up poll, whose cancellation/suspend checks stay in force.
+    for forbidden in ("g_usleep", "while (", "for (;;)", "g_main_context_iteration"):
+        assert forbidden not in added
+    assert "GOODIX_MANUAL_FDT_MAX_FINGER_UP_POLLS" not in removed
+    assert "goodix_manual_fdt_check_cancelled" not in removed
+    # A retry raised by an SSM goes out as a report, never to *_complete().
+    assert "error->domain == FP_DEVICE_RETRY" in added
+
+
+def test_finger_guard_patches_leave_threshold_secrets_and_session_alone():
+    for patch in (FINGER_PRESENT_PATCH, NON_CONTACT_GATE_PATCH):
+        text = patch.read_text(encoding="utf-8")
+        added = added_lines(patch)
+        removed = _removed_lines(patch)
+        touched = [l[6:] for l in text.splitlines() if l.startswith("+++ b/")]
+        assert touched and all(
+            t.rsplit("/", 1)[-1] in {"goodix53x5-scan.c", "goodix53x5-auth.c",
+                                     "goodix53x5-auth.h", "goodix53x5-private.h"}
+            for t in touched
+        ), touched
+        assert "GOODIX_SIGFM_BEST_MIN" not in removed
+        assert "define GOODIX_SIGFM_BEST_MIN" not in added
+        assert not re.search(r"(?<!TLS_)PSK|\bpsk\b|\botp\b", added, re.I), "key material"
+        for forbidden in ("->tls", "persistent_mutation"):
+            assert forbidden not in added, forbidden
+
+
+def test_finger_guard_log_calls_carry_no_frame_or_template_identifiers():
+    all_calls = []
+    for patch in (FINGER_PRESENT_PATCH, NON_CONTACT_GATE_PATCH):
+        for call in _log_calls(added_lines(patch)):
+            all_calls.append(call)
+            fmt = _format_of(call)
+            for spec in re.findall(r"%[-+ #0]*\d*(?:\.\d+)?[a-zA-Z]", fmt):
+                assert spec in ("%d", "%u", "%s"), (spec, call)
+            for forbidden in ("feature", "template", "payload", "%p", "%x", "%f"):
+                assert forbidden not in fmt, (forbidden, call)
+            args = call[call.index(",") :] if "," in call else ""
+            for forbidden in ("img12", "img8", "reference_image", "captured_image",
+                              "fdt_event_data", "tmpl", "feature", "reading", "psk"):
+                assert forbidden not in args, (forbidden, call)
+    assert all_calls
+    # The attempt summary stays integer-only after the new fields.
+    added = added_lines(FINGER_PRESENT_PATCH)
+    for key in ("clear_ms", "clear_dev_polls", "clear_rejects", "up_wait_ms", "up_first"):
+        assert f"{key}=%" in added
+
+
+def test_non_contact_gate_precedes_scoring_and_reuses_the_enrollment_limit():
+    added = added_lines(NON_CONTACT_GATE_PATCH)
+
+    assert re.search(
+        r"#define GOODIX_VERIFY_NO_CONTACT_FRACTION\s+GOODIX_ENROLL_NO_CONTACT_FRACTION\b", added)
+    # Context lines count here: extraction is existing code the gate must precede.
+    text = "\n".join(
+        line[1:] for line in NON_CONTACT_GATE_PATCH.read_text(encoding="utf-8").splitlines()
+        if line[:1] in "+ " and not line.startswith("+++")
+    )
+    gate = text.index("self->captured_clipped_fraction > GOODIX_VERIFY_NO_CONTACT_FRACTION")
+    extract = text.index("goodix_match_extract (self->captured_image)")
+    assert gate < extract  # decided before any feature extraction or scoring
+    block = text[gate:extract]
+    assert block.count("FP_DEVICE_RETRY_TOO_SHORT") == 2  # verify and identify
+    assert "self->verify_wait_finger_up = FALSE;" in block  # no finger-up wait
+    assert "return;" in block
+    assert "retry:too-short" in added
+    assert "GOODIX_SUMMARY_RESULT_RETRY_TOO_SHORT" in added
+    assert "goodix_match_serialized_feature" not in added
+    # 0.90, as in patch 0010.
+    assert "#define GOODIX_ENROLL_NO_CONTACT_FRACTION 0.90" in added_lines(RETRY_REASON_PATCH)

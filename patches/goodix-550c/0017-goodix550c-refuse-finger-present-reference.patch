@@ -1,0 +1,523 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fingerprint Lab <noreply@example.invalid>
+Date: Sat, 17 Oct 2026 14:00:00 +0200
+Subject: [PATCH] goodix550c: refuse a reference taken with a finger on the pad
+
+Two ways a finger ends up inside the no-finger reference were observed. Both
+have the same effect: the reference is subtracted from every capture, so a
+finger baked into it erases that finger from the probe and the attempt scores
+as a stranger's.
+
+First, the pre-reference clear check only asked that two consecutive manual
+FDT readings agree with each other. A finger resting still on the pad agrees
+with itself, so it was adopted as the "no-finger" baseline and the reference
+frame was read with the finger on it. Verify/identify now compares every poll of
+that phase with the last confirmed-empty baseline using the finger-down
+threshold (delta_down), requires GOODIX_CLEAR_CONSECUTIVE_POLLS clear polls in a
+row before the reading may be adopted, and gives up after
+GOODIX_CLEAR_WINDOW_MAX_MS with FP_DEVICE_RETRY_REMOVE_FINGER. Because real
+baseline drift could look like a finger forever, the third refusal in a row
+adopts the reading anyway; the reference mean check below remains the guard.
+The post-reference phase is left alone: its baseline is expected to move when
+image mode is switched off. Enrollment is unchanged.
+
+Second, a finger can arrive during the reference read itself. An empty pad
+averages about 2350 and a finger-covered one far lower, so a reference whose mean
+is below GOODIX_REF_FINGER_MEAN_MAX (2000) is treated as finger-present: it is
+never stored, and the read is retried inside the existing 60 x 250 ms budget,
+capped separately at GOODIX_REFERENCE_FINGER_MAX_RETRIES. On exhaustion
+verify/identify switch the readout off and end with a remove-finger retry;
+enrollment fails as it did for the no-signal case.
+
+Third, a no-match no longer reports before the finger lifts. The result is held
+back for at most GOODIX_RESULT_FINGER_UP_WAIT_MS while the finger-up poll runs,
+so the caller's next claim (PAM retries, the lock screen's three tries) does not
+begin with the finger still down. If the finger is still down at the limit the
+result is reported at once and the ordinary bounded finger-up wait continues.
+This applies to the manual-FDT wait only; the asynchronous-event path keeps its
+previous behaviour. Because the clear window above already requires consecutive
+clear polls before an action is ready, a claim that starts with a finger down is
+refused instead of calibrating on it.
+
+The attempt summary line gains clear_ms, clear_dev_polls, clear_rejects,
+up_wait_ms and up_first, and the result string retry:finger-present. A retry
+raised by the SSM is now delivered through the verify/identify report, because
+libfprint does not accept a retry error from the completion call. The reference
+retry counter is also reset at the start of each action. The match threshold is
+unchanged.
+
+---
+
+--- a/drivers/goodix53x5/goodix53x5-auth.c
++++ b/drivers/goodix53x5/goodix53x5-auth.c
+@@ -25,6 +25,7 @@
+ #include "goodix53x5-scan.h"
+ #include "goodix53x5-match.h"
+ #include "goodix53x5-auth.h"
++#include "goodix53x5-safety.h"
+ #include "fpi-print.h"
+ 
+ #include <string.h>
+@@ -67,6 +68,7 @@ goodix_summary_result_name (gint result)
+     case GOODIX_SUMMARY_RESULT_NO_MATCH: return "no-match";
+     case GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER: return "retry:remove-finger";
+     case GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID: return "retry:data-invalid";
++    case GOODIX_SUMMARY_RESULT_RETRY_FINGER_PRESENT: return "retry:finger-present";
+     default: return "retry:error";
+     }
+ }
+@@ -90,7 +92,9 @@ goodix_log_attempt_summary (FpiDeviceGoodix53x5 *self,
+   g_message ("goodix550c attempt: action=%s ready_to_down_ms=%d down_polls=%u "
+              "settle_ms=%d ref_mean=%d ref_retries=%u noncontact_x1000=%d "
+              "keypoints=%d best_score=%d early_exit=%d threshold=%d "
+-             "result=%s dmax_pos=%d dmax_neg=%d",
++             "result=%s dmax_pos=%d dmax_neg=%d "
++             "clear_ms=%d clear_dev_polls=%u clear_rejects=%u "
++             "up_wait_ms=%d up_first=%d",
+              action == FPI_DEVICE_ACTION_IDENTIFY ? "identify" : "verify",
+              ready_to_down_ms, self->summary_down_polls,
+              self->summary_settle_ms, self->summary_ref_mean,
+@@ -99,7 +103,10 @@ goodix_log_attempt_summary (FpiDeviceGoodix53x5 *self,
+              self->summary_keypoints, self->summary_best_score,
+              self->summary_early_exit ? 1 : 0, GOODIX_SIGFM_BEST_MIN,
+              goodix_summary_result_name (result),
+-             self->summary_dmax_pos, self->summary_dmax_neg);
++             self->summary_dmax_pos, self->summary_dmax_neg,
++             self->summary_clear_ms, self->summary_clear_dev_polls,
++             self->clear_reject_streak,
++             self->summary_up_wait_ms, self->summary_up_first);
+ }
+ 
+ /* Verify/Identify SSM */
+@@ -165,7 +172,7 @@ goodix_queue_identify_report (FpiDeviceGoodix53x5 *self,
+   self->pending_result_error = error;
+ }
+ 
+-static void
++void
+ goodix_flush_pending_result_report (FpDevice *dev)
+ {
+   FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+@@ -479,7 +486,18 @@ goodix_verify_ssm_handler (FpiSsm   *ssm,
+         g_clear_pointer (&self->captured_image, g_free);
+ 
+         if (self->verify_wait_finger_up)
+-          goodix_flush_pending_result_report (dev);
++          {
++            /* Hold the result back until the finger lifts (bounded by
++             * GOODIX_RESULT_FINGER_UP_WAIT_MS in the finger-up wait), so the
++             * caller's next claim never starts with the finger still down.
++             * Only the manual-FDT wait can do that; the asynchronous-event
++             * path keeps reporting immediately. */
++            if (self->variant == GOODIX_VARIANT_TLS_PSK &&
++                goodix_550c_manual_fdt_poll_allowed ())
++              self->defer_result_report = TRUE;
++            else
++              goodix_flush_pending_result_report (dev);
++          }
+ 
+         fpi_ssm_next_state (ssm);
+       }
+@@ -505,6 +523,21 @@ goodix_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+   g_clear_pointer (&self->reference_image, g_free);
+   g_clear_pointer (&self->captured_image, g_free);
+ 
++  self->defer_result_report = FALSE;
++  self->reference_finger_refused = FALSE;
++
++  /* A retry may not be passed to fpi_device_*_complete; it has to be reported
++   * as the attempt's result. The pad-not-clear and finger-in-reference
++   * refusals end the action that way. */
++  if (error != NULL && error->domain == FP_DEVICE_RETRY)
++    {
++      if (action == FPI_DEVICE_ACTION_IDENTIFY)
++        goodix_queue_identify_report (self, NULL, g_steal_pointer (&error));
++      else
++        goodix_queue_verify_report (self, FPI_MATCH_ERROR,
++                                    g_steal_pointer (&error));
++    }
++
+   goodix_log_attempt_summary (self, action);
+ 
+   if (error)
+@@ -564,10 +597,18 @@ goodix_auth_start (FpDevice *dev)
+   goodix_clear_pending_result_report (self);
+   self->action_result_reported = FALSE;
+   self->verify_wait_finger_up = FALSE;
++  self->defer_result_report = FALSE;
++  self->reference_finger_refused = FALSE;
++  self->reference_retries = 0;
++  self->reference_finger_retries = 0;
+   g_clear_pointer (&self->reference_image, g_free);
+   g_clear_pointer (&self->captured_image, g_free);
+ 
+   /* Log-only summary state for this attempt. */
++  self->summary_clear_dev_polls = 0;
++  self->summary_clear_ms = 0;
++  self->summary_up_wait_ms = 0;
++  self->summary_up_first = 0;
+   self->summary_ready_us = 0;
+   self->summary_down_us = 0;
+   self->summary_down_polls = 0;
+--- a/drivers/goodix53x5/goodix53x5-auth.h
++++ b/drivers/goodix53x5/goodix53x5-auth.h
+@@ -29,3 +29,7 @@ void goodix_auth_start (FpDevice *dev);
+ /* Drop any match result queued while waiting for finger-up. Used by auth
+  * setup and by close to discard stale results. */
+ void goodix_clear_pending_result_report (FpiDeviceGoodix53x5 *self);
++
++/* Report the queued verify/identify result now. Used by the finger-up wait
++ * when it has held the result back for as long as it is allowed to. */
++void goodix_flush_pending_result_report (FpDevice *dev);
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -118,6 +118,34 @@ typedef enum
+ #define GOODIX_REFERENCE_MAX_RETRIES 60
+ #define GOODIX_REFERENCE_RETRY_DELAY_MS 250
+ 
++/* An empty pad reads about 2350 in the no-finger reference frame; one read
++ * with a finger resting on it averages far lower (finger captures measured
++ * 1490-1600). A reference below this is taken to have been captured with a
++ * finger present and is retried, never stored: it is subtracted from every
++ * capture, so a finger baked into it erases that finger from the probe.
++ * Retries spend the same budget as the no-signal case, capped separately so a
++ * finger left on the pad is reported after a few seconds rather than fifteen. */
++#define GOODIX_REF_FINGER_MEAN_MAX 2000
++#define GOODIX_REFERENCE_FINGER_MAX_RETRIES 16
++
++/* Verify/identify only. The stable pre-reference reading is adopted as the new
++ * no-finger baseline only when it matches the last confirmed-empty baseline;
++ * otherwise a finger resting on the pad would become "empty" and every later
++ * capture would be judged against it. The window is bounded: after this long
++ * without two consecutive clear polls the attempt is refused with
++ * FP_DEVICE_RETRY_REMOVE_FINGER. Real baseline drift could look like a finger
++ * forever, so the third refusal in a row adopts the reading anyway (the
++ * reference mean check above is then the remaining guard). */
++#define GOODIX_CLEAR_CONSECUTIVE_POLLS 2
++#define GOODIX_CLEAR_WINDOW_MAX_MS 3000
++#define GOODIX_CLEAR_REJECT_ADOPT_AFTER 3
++
++/* After a non-matching or unusable attempt, wait at most this long for the
++ * finger to lift BEFORE reporting the result, so the caller's next claim does
++ * not start with the finger still down. If it is still down the result is
++ * reported anyway and the ordinary bounded finger-up wait continues. */
++#define GOODIX_RESULT_FINGER_UP_WAIT_MS 1500
++
+ /* PSK white box for writing all-zero PSK */
+ #define GOODIX_PSK_WHITE_BOX_LEN 96
+ 
+@@ -261,6 +289,15 @@ struct _FpiDeviceGoodix53x5
+ 
+   /* Consecutive no-signal reference frames in the current capture attempt. */
+   guint      reference_retries;
++  guint      reference_finger_retries;
++  /* Reference frame was refused as finger-covered and the sensor readout is
++   * being switched off; the action then ends with a remove-finger retry. */
++  gboolean   reference_finger_refused;
++  /* Consecutive verify/identify actions refused for a non-clear pad. */
++  guint      clear_reject_streak;
++  /* Verify/identify result is held back until the finger lifts (bounded). */
++  gboolean   defer_result_report;
++  gint64     up_wait_start_us;
+ 
+   /* Monotonic time of the previously decoded frame, for the capture-path
+    * diagnostic only. Zero until the first frame of a session is decoded. */
+@@ -284,6 +321,10 @@ struct _FpiDeviceGoodix53x5
+   gint       summary_best_score;
+   gboolean   summary_early_exit;
+   gint       summary_result;
++  guint      summary_clear_dev_polls;
++  gint       summary_clear_ms;
++  gint       summary_up_wait_ms;
++  gint       summary_up_first;
+ };
+ 
+ /* Open phases reached, in order, for the open summary line. */
+@@ -305,4 +346,5 @@ typedef enum
+   GOODIX_SUMMARY_RESULT_NO_MATCH,
+   GOODIX_SUMMARY_RESULT_RETRY_REMOVE_FINGER,
+   GOODIX_SUMMARY_RESULT_RETRY_DATA_INVALID,
++  GOODIX_SUMMARY_RESULT_RETRY_FINGER_PRESENT,
+ } GoodixSummaryResult;
+--- a/drivers/goodix53x5/goodix53x5-scan.c
++++ b/drivers/goodix53x5/goodix53x5-scan.c
+@@ -27,6 +27,7 @@
+ #include "goodix53x5-image.h"
+ #include "goodix53x5-safety.h"
+ #include "goodix53x5-scan.h"
++#include "goodix53x5-auth.h"
+ 
+ #include <string.h>
+ 
+@@ -60,6 +61,11 @@ typedef struct
+   gboolean last_candidate;
+   gboolean reference_post_capture;
+   guint8 *provisional_baseline;
++  /* Verify/identify clear window (pre-reference phase only). */
++  guint clear_streak;
++  gint64 clear_start_us;
++  gint64 clear_dev_start_us;
++  gboolean clear_bypass;
+ } GoodixManualFdtPollState;
+ 
+ /* Finger-wait SSM (awaiting finger down) */
+@@ -153,6 +159,39 @@ goodix_reference_frame_has_signal (const guint16 *img12)
+   return (total / GOODIX_SENSOR_PIXELS) >= GOODIX_REFERENCE_MIN_MEAN;
+ }
+ 
++static gint
++goodix_reference_frame_mean (const guint16 *img12)
++{
++  guint64 total = 0;
++
++  for (int i = 0; i < GOODIX_SENSOR_PIXELS; i++)
++    total += img12[i];
++
++  return (gint) (total / GOODIX_SENSOR_PIXELS);
++}
++
++/**
++ * goodix_reference_frame_has_finger:
++ *
++ * The other side of the check above. An empty pad averages about 2350; a frame
++ * read with a finger resting on it averages well below GOODIX_REF_FINGER_MEAN_MAX.
++ * Only meaningful for a frame that already passed the signal check.
++ */
++static gboolean
++goodix_reference_frame_has_finger (const guint16 *img12)
++{
++  return goodix_reference_frame_mean (img12) < GOODIX_REF_FINGER_MEAN_MAX;
++}
++
++static gboolean
++goodix_auth_action_active (FpDevice *dev)
++{
++  FpiDeviceAction action = fpi_device_get_current_action (dev);
++
++  return action == FPI_DEVICE_ACTION_VERIFY ||
++         action == FPI_DEVICE_ACTION_IDENTIFY;
++}
++
+ /* ========================================================================
+  * Capture-path diagnostic
+  * ======================================================================== */
+@@ -432,6 +471,78 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
+           }
+ 
+         reading = pl + 4;
++
++        /* Verify/identify must not adopt a finger resting on the pad as the
++         * no-finger baseline: it would stay stable, pass the check below and
++         * be subtracted as "empty". Judge every poll against the last
++         * confirmed-empty baseline with the finger-down threshold, and require
++         * consecutive clear polls before the reading may be adopted. */
++        if (!state->reference_post_capture && goodix_auth_action_active (dev) &&
++            self->fdt_data_tx_on != NULL)
++          {
++            guint dev_pairs = 0;
++            guint16 dev_max = 0;
++            gint64 now_us = g_get_monotonic_time ();
++
++            if (state->clear_start_us == 0)
++              state->clear_start_us = now_us;
++            if (!goodix_device_measure_fdt_delta (self->fdt_data_tx_on, reading,
++                                                  GOODIX_FDT_BASE_LEN,
++                                                  self->calib.delta_down,
++                                                  &dev_max, &dev_pairs))
++              {
++                fpi_ssm_mark_failed (ssm,
++                                     fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                               "Malformed clear-window FDT comparison"));
++                return;
++              }
++
++            if (dev_pairs == 0)
++              {
++                state->clear_streak++;
++                state->clear_dev_start_us = 0;
++              }
++            else
++              {
++                state->clear_streak = 0;
++                self->summary_clear_dev_polls++;
++                if (state->clear_dev_start_us == 0)
++                  state->clear_dev_start_us = now_us;
++
++                if (!state->clear_bypass &&
++                    (now_us - state->clear_dev_start_us) / 1000 >=
++                    GOODIX_CLEAR_WINDOW_MAX_MS)
++                  {
++                    self->summary_clear_ms =
++                      (gint) ((now_us - state->clear_start_us) / 1000);
++                    if (self->clear_reject_streak + 1 >= GOODIX_CLEAR_REJECT_ADOPT_AFTER)
++                      {
++                        fp_dbg ("Pad still not clear after %u refusals; adopting "
++                                "the reading (reference mean check remains)",
++                                self->clear_reject_streak);
++                        self->clear_reject_streak = 0;
++                        state->clear_bypass = TRUE;
++                      }
++                    else
++                      {
++                        self->clear_reject_streak++;
++                        self->summary_result =
++                          GOODIX_SUMMARY_RESULT_RETRY_FINGER_PRESENT;
++                        fp_dbg ("Pad not clear for %dms; asking for the finger "
++                                "to be removed (refusal %u/%u)",
++                                GOODIX_CLEAR_WINDOW_MAX_MS,
++                                self->clear_reject_streak,
++                                GOODIX_CLEAR_REJECT_ADOPT_AFTER);
++                        fpi_ssm_mark_failed (ssm,
++                                             fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
++                        return;
++                      }
++                  }
++              }
++          }
++        else
++          state->clear_bypass = TRUE;
++
+         if (state->provisional_baseline == NULL)
+           {
+             state->provisional_baseline = g_memdup2 (reading,
+@@ -454,8 +565,17 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
+             stable = changed_pairs == 0;
+             goodix_manual_fdt_log_poll (state, phase, stable);
+             if (stable &&
+-                state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS)
++                state->consecutive >= GOODIX_MANUAL_FDT_CONFIRMATIONS &&
++                (state->clear_bypass ||
++                 state->clear_streak >= GOODIX_CLEAR_CONSECUTIVE_POLLS))
+               {
++                if (state->clear_start_us != 0)
++                  {
++                    self->summary_clear_ms =
++                      (gint) ((g_get_monotonic_time () - state->clear_start_us) / 1000);
++                    if (!state->reference_post_capture)
++                      self->clear_reject_streak = 0;
++                  }
+                 goodix_manual_fdt_refresh_baseline (self, reading);
+                 fp_dbg ("Manual FDT %s baseline confirmed after %u polls",
+                         state->reference_post_capture ? "post-reference" :
+@@ -591,13 +711,7 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
+         goodix_550c_log_frame_stats (self, img12, "reference", self->calib.dac_l);
+ 
+         if (self->log_summary)
+-          {
+-            guint64 sum = 0;
+-
+-            for (int i = 0; i < GOODIX_SENSOR_PIXELS; i++)
+-              sum += img12[i];
+-            self->summary_ref_mean = (gint) (sum / GOODIX_SENSOR_PIXELS);
+-          }
++          self->summary_ref_mean = goodix_reference_frame_mean (img12);
+ 
+         /* A reference frame carrying no signal must never be stored. It is
+          * subtracted from every subsequent capture, so an all-zero one silently
+@@ -628,7 +742,47 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
+                                                            GOODIX_REFERENCE_MAX_RETRIES));
+             return;
+           }
++
++        /* A frame with signal can still hold a finger. Never store it: retry
++         * while the finger may yet lift, within the same retry budget. */
++        if (goodix_reference_frame_has_finger (img12))
++          {
++            if (self->reference_retries < GOODIX_REFERENCE_MAX_RETRIES &&
++                self->reference_finger_retries < GOODIX_REFERENCE_FINGER_MAX_RETRIES)
++              {
++                self->reference_retries++;
++                self->reference_finger_retries++;
++                self->summary_ref_retries++;
++                fp_dbg ("Reference frame mean is below %d, a finger is likely "
++                        "present; retrying (%u/%u)",
++                        GOODIX_REF_FINGER_MEAN_MAX,
++                        self->reference_finger_retries,
++                        GOODIX_REFERENCE_FINGER_MAX_RETRIES);
++                fpi_ssm_jump_to_state_delayed (ssm, GOODIX_REF_CAPTURE_REG_ON,
++                                               GOODIX_REFERENCE_RETRY_DELAY_MS);
++                return;
++              }
++
++            self->reference_retries = 0;
++            self->reference_finger_retries = 0;
++            if (goodix_auth_action_active (dev))
++              {
++                /* Switch the readout off first, then end the action with a
++                 * remove-finger retry from REG_OFF_DONE. */
++                self->reference_finger_refused = TRUE;
++                self->summary_result = GOODIX_SUMMARY_RESULT_RETRY_FINGER_PRESENT;
++                goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x02);
++                return;
++              }
++
++            fpi_ssm_mark_failed (ssm,
++                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                           "Reference frame stayed below the finger threshold after %u attempts",
++                                                           GOODIX_REFERENCE_FINGER_MAX_RETRIES));
++            return;
++          }
+         self->reference_retries = 0;
++        self->reference_finger_retries = 0;
+ 
+         g_clear_pointer (&self->reference_image, g_free);
+         self->reference_image = g_steal_pointer (&img12);
+@@ -643,6 +797,13 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
+ 
+     case GOODIX_REF_CAPTURE_REG_OFF_DONE:
+       /* 550c: reg-off ACK consumed by the command sub-SSM. */
++      if (self->reference_finger_refused)
++        {
++          self->reference_finger_refused = FALSE;
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
++          return;
++        }
+       if (self->variant == GOODIX_VARIANT_TLS_PSK &&
+           goodix_550c_manual_fdt_poll_allowed ())
+         {
+@@ -1033,6 +1194,7 @@ goodix_finger_up_ssm_handler (FpiSsm   *ssm,
+             return;
+           if (fpi_ssm_get_data (ssm) == NULL)
+             goodix_manual_fdt_poll_state_new (ssm, self);
++          self->up_wait_start_us = g_get_monotonic_time ();
+           fp_dbg ("Manual FDT finger-up poll armed");
+           fpi_ssm_jump_to_state (ssm, GOODIX_FINGER_UP_POLL_REQUEST);
+           return;
+@@ -1136,6 +1298,15 @@ goodix_finger_up_ssm_handler (FpiSsm   *ssm,
+             goodix_manual_fdt_refresh_baseline (self, reading);
+             fp_dbg ("Manual FDT finger-up confirmed after %u polls",
+                     state->polls);
++            if (self->defer_result_report)
++              {
++                /* Lifted inside the hold-back window: the result goes out
++                 * after this, so the next claim starts with the pad clear. */
++                self->summary_up_wait_ms =
++                  (gint) ((g_get_monotonic_time () - self->up_wait_start_us) / 1000);
++                self->summary_up_first = 1;
++                self->defer_result_report = FALSE;
++              }
+             fpi_device_report_finger_status_changes (dev,
+                                                      FP_FINGER_STATUS_NONE,
+                                                      FP_FINGER_STATUS_PRESENT | FP_FINGER_STATUS_NEEDED);
+@@ -1143,6 +1314,20 @@ goodix_finger_up_ssm_handler (FpiSsm   *ssm,
+             return;
+           }
+ 
++        /* Held back for as long as allowed and the finger is still down:
++         * report now and keep waiting under the ordinary budget below. */
++        if (self->defer_result_report &&
++            (g_get_monotonic_time () - self->up_wait_start_us) / 1000 >=
++            GOODIX_RESULT_FINGER_UP_WAIT_MS)
++          {
++            fp_dbg ("Finger still down after %dms; reporting the result now",
++                    GOODIX_RESULT_FINGER_UP_WAIT_MS);
++            self->summary_up_wait_ms = GOODIX_RESULT_FINGER_UP_WAIT_MS;
++            self->summary_up_first = 0;
++            self->defer_result_report = FALSE;
++            goodix_flush_pending_result_report (dev);
++          }
++
+         if (goodix_manual_fdt_check_cancelled (ssm, dev))
+           return;
+         if (goodix_manual_fdt_budget_exhausted (ssm, state,
