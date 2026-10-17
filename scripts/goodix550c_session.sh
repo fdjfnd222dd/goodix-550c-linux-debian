@@ -77,7 +77,7 @@ touch_block() {
         marker_start "$label" "$finger"
         verify_once
         marker_end
-        ((i < count)) && pause_next
+        if ((i < count)); then pause_next; fi
     done
 }
 
@@ -103,7 +103,7 @@ b2() {
         QUIET_START=1 verify_once
         wait
         marker_end
-        ((i < count)) && pause_next
+        if ((i < count)); then pause_next; fi
     done
 }
 
@@ -137,7 +137,7 @@ b5() {
         t1=$(date +%s.%N)
         printf '   -> sudo finished in %.1fs\n' "$(echo "$t1 - $t0" | bc)"
         marker_end
-        ((i < 10)) && pause_next
+        if ((i < 10)); then pause_next; fi
     done
 }
 
