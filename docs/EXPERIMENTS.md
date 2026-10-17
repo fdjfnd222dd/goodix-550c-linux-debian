@@ -2,7 +2,7 @@
 
 Goal: maximise **genuine first-try match** and **sudo/lock-screen first-try success**, minimise time-to-result, with **0 impostor accepts** and **0 open failures**, without touching the safety invariants in `CLAUDE.md`.
 
-## Where we are (2026-10-17, `+goodix550c5`, fresh enrollment, 17 stages)
+## Where we are (2026-10-17, `+goodix550c5`, fresh enrollment, 16 samples)
 | Metric | Value | Target |
 |---|---|---|
 | Genuine first try (B1) | 85% | ≥ 95% |
@@ -49,6 +49,23 @@ Never in scope: lowering threshold 150, reflashing, writing PSK, disabling the f
 5. Log the result row in the table below; commit the patch (kept) or a note (reverted).
 
 Small samples are noisy (20 runs → ±10 pts). Re-run a promising change once before keeping it.
+
+## Planner findings (2026-10-17, from c4-reenrolled + c5 logs)
+- SIGFM score ≈ C(C(M,2),2) for M geometrically consistent matches: 150 ≈ 6–7 matches, impostor max 3 ≈ 3 matches, median genuine ≈ 14.
+- `GOODIX_ENROLL_SAMPLES` is **16** in code (`private.h:74`), not 17.
+- Genuine misses (17/65): 7 score ≤ 3 (finger region never enrolled → coverage problem), 6 score 75–148 (near misses). Retries miss 43% vs first tries 18%: users re-place the same way.
+- Capture timing is NOT the cause: noncontact 0 on every miss, ready_to_down and dmax_neg uncorrelated with score, lift_rebase attempts 6/6 matched.
+- Time after the finger lands ≈ 0.6 s: finger-down detection 140–260 ms (2 polls × 119.5 ms) + settle 300 ms + capture/match ~100 ms. Matching is not the bottleneck. Before "ready": open ~600 ms + clear ~450 ms + reference ~350 ms.
+- Matcher constants (ratio 0.85, length/angle 5%, SIFT/CLAHE) stay fixed: loosening them is equivalent to lowering the threshold, and SIFT changes invalidate stored templates. Keypoint positions are truncated to `Point2i` (precision loss) → candidate log-only `shadow_score` study, never decision-affecting without a separate review.
+
+## Experiment cards (ranked)
+1. **Second enrollment slot for the same finger** (right index enrolled again as `right-middle-finger`, coached placements: centre, tip, left, right, base). Metric: B1 first-try and count of misses ≤ 3; B3 impostor ×≥8 (now 3 slots × 16 templates). No build.
+2. **SETTLE_MS 300 → 150** (tunable). Metric: down_to_result −150 ms, miss rate and noncontact unchanged.
+3. **ENROLL_SAMPLES 16 → 24** (one coached slot; re-enroll). Compare with card 1.
+4. **POLL_DELAY_MS 100 → 60**. Metric: time-to-ready and detection latency.
+5. **Shadow score** (log-only) — only if impostor shadow max ≤ 15.
+6. **UP_WAIT_MS 1500 → 800**. Metric: sudo retry latency.
+UX: on retry say "shift your finger slightly" (retries currently miss 43%).
 
 ## Results log
 | Round | Variable | Values | B1 first-try | B5 first-try | B2 ≤2 | Impostor | Decision |
