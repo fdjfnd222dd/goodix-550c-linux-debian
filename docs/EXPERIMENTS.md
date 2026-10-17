@@ -74,3 +74,4 @@ UX: on retry say "shift your finger slightly" (retries currently miss 43%).
 | c4 (0016–0018) | guards | — | 85% | 70% | 88% | 0 | kept |
 | c4 + re-enroll | enrollment | 17 stages fresh | — | 40%* | 75% | 0 | kept (*too-short; fixed by 0019) |
 | c5 (0019) | touch direction | ±20 | 85% | 80% | — | 0 | kept |
+| c6 (0020, defaults) | — (timing instrumented) | — | 100% (12) | — | — | 0 (max 0) | kept. down→result 411 ms = settle 300 + capture ~100 + match 5; ready→match 1267 ms incl. reaction |
