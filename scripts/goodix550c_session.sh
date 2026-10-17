@@ -158,7 +158,7 @@ report() {
     local name="${1:-session}" since out_dir json py
     since="${SINCE:-$(cat "$START_FILE" 2>/dev/null || true)}"
     [[ -n "$since" ]] || { echo "No session start recorded; run a block first or set SINCE='YYYY-MM-DD HH:MM:SS'." >&2; exit 1; }
-    out_dir="$ROOT/research/baseline"
+    out_dir="$HOME/goodix550c-debs/measurements"
     mkdir -p "$out_dir"
     json="$out_dir/$(date +%F)-$name.json"
     py="$ROOT/.venv/bin/python"
