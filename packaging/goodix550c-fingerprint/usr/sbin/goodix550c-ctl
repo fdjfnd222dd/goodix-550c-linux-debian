@@ -15,6 +15,7 @@ UDEV_RULE="$R/usr/lib/udev/rules.d/60-goodix550c-power.rules"
 TLP_CONF="$R/etc/tlp.d/50-goodix550c.conf"
 PIN_CONF="$R/etc/apt/preferences.d/goodix550c-libfprint"
 PAM_PROFILE="$R/usr/share/pam-configs/$PROFILE"
+PAM_CONF="$PSK_DIR/pam.conf"
 COMMON_AUTH="$R/etc/pam.d/common-auth"
 DEBS="${GOODIX550C_DEBS:-$HOME/goodix550c-debs}"
 VENDOR=27c6
@@ -26,7 +27,8 @@ usage() {
   cat <<'USAGE'
 Usage: goodix550c-ctl <command> [args]
 
-  status                 show package, hold, pin, drop-in, USB power, PSK, store, PAM, recent log (non-root OK)
+  status [--json]        show package, hold, pin, drop-in, USB power, PSK, store, PAM, recent log (non-root OK);
+                         --json prints one machine-readable object (used by the "finger" TUI)
   doctor                 pass/fail checklist (exit 1 if anything failed)
   recover                restart fprintd, re-trigger udev, re-apply hold, harden store, show status   (root)
   enroll <finger>        enroll a finger for the invoking user, e.g. right-index-finger
@@ -34,6 +36,9 @@ Usage: goodix550c-ctl <command> [args]
   psk-backup <dest>      copy the installed PSK to <dest> (0600); refuses repo and /tmp paths   (root)
   harden-store           chmod -R go-rwx /var/lib/fprint   (root)
   pam enable|disable     enable/disable the pam-auth-update profile   (root)
+  pam set --tries N --timeout S
+                         fingerprint tries (1-5) and sudo/polkit timeout in seconds (5-30); saved in
+                         /etc/goodix550c/pam.conf and kept across package upgrades   (root)
   rollback-stock         back to stock libfprint-2-2 (keeps prints and PSK)   (root)
   -h, --help             this help
 USAGE
@@ -80,7 +85,56 @@ store_bad_perms() {
   find "$STORE" \( -type d -o -type f \) -perm /077 2>/dev/null | head -n 1 || true
 }
 
+json_str() { # escape for a JSON string value
+  local v="$1"
+  v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//$'\t'/ }"; v="${v//$'\n'/ }"
+  printf '"%s"' "$v"
+}
+json_bool() { if "$@" >/dev/null 2>&1; then printf true; else printf false; fi; }
+
+# prints "<tries> <timeout>" as currently configured (common-auth, else profile, else pam.conf, else defaults)
+pam_values() {
+  local line t o
+  line="$(grep -h 'pam_fprintd\.so' "$COMMON_AUTH" 2>/dev/null | head -n 1 || true)"
+  [ -n "$line" ] || line="$(grep -h 'pam_fprintd\.so' "$PAM_PROFILE" 2>/dev/null | head -n 1 || true)"
+  t="$(printf '%s' "$line" | grep -o 'max-tries=[0-9]*' | head -n 1 | cut -d= -f2 || true)"
+  o="$(printf '%s' "$line" | grep -o 'timeout=[0-9]*' | head -n 1 | cut -d= -f2 || true)"
+  echo "${t:-3} ${o:-15}"
+}
+
+cmd_status_json() {
+  local v pv up psk_state="null" held=false pin=false lg
+  v="$(pkg_version "$LIBPKG")"; pv="$(pkg_version "$PKG")"
+  is_held && held=true
+  [ -f "$PIN_CONF" ] && pin=true
+  up="$(usb_power_state | head -n 1 | cut -d= -f2)"
+  if [ "$(id -u)" -eq 0 ] || [ -n "$R" ]; then
+    if [ -f "$PSK" ]; then psk_state=true; else psk_state=false; fi
+  fi
+  local tries timeout
+  read -r tries timeout < <(pam_values)
+  printf '{'
+  printf '"libfprint_version": %s, ' "$(json_str "$v")"
+  printf '"patched": %s, ' "$(json_bool lib_is_goodix)"
+  printf '"held": %s, ' "$held"
+  printf '"apt_pin": %s, ' "$pin"
+  printf '"package_version": %s, ' "$(json_str "$pv")"
+  printf '"sensor_present": %s, ' "$(json_bool device_present)"
+  printf '"usb_power": %s, ' "$(json_str "$up")"
+  printf '"dropin_present": %s, ' "$([ -e "$DROPIN" ] && echo true || echo false)"
+  printf '"psk_present": %s, ' "$psk_state"
+  printf '"store_ok": %s, ' "$(json_bool store_ok)"
+  printf '"pam_enabled": %s, ' "$(json_bool pam_profile_enabled)"
+  printf '"pam_tries": %s, "pam_timeout": %s, ' "$tries" "$timeout"
+  printf '"pam_conf_present": %s, ' "$([ -f "$PAM_CONF" ] && echo true || echo false)"
+  lg="$(journalctl -u fprintd -b --no-pager -o cat 2>/dev/null | grep -E 'goodix550c (open|attempt):' | tail -n 1 || true)"
+  printf '"last_log": %s' "$(json_str "$lg")"
+  printf '}\n'
+}
+
 cmd_status() {
+  if [ "${1:-}" = "--json" ]; then cmd_status_json; return; fi
+  [ $# -eq 0 ] || die "usage: goodix550c-ctl status [--json]"
   local v pv
   echo "== goodix550c status"
   v="$(pkg_version "$LIBPKG")"; echo "libfprint-2-2 version: ${v:-not installed}"
@@ -111,7 +165,7 @@ cmd_status() {
   elif [ ! -r "$STORE" ]; then echo "print store: not readable by this user (good; run as root to check)"
   elif [ -n "$bad" ]; then echo "print store: group/other-accessible entries present (fix: sudo goodix550c-ctl harden-store)"
   else echo "print store: ok (no group/other access)"; fi
-  if pam_profile_enabled; then echo "PAM profile: enabled in common-auth"; else echo "PAM profile: NOT enabled (sudo goodix550c-ctl pam enable)"; fi
+  if pam_profile_enabled; then echo "PAM profile: enabled in common-auth (tries/timeout: $(pam_values | tr ' ' '/'))"; else echo "PAM profile: NOT enabled (sudo goodix550c-ctl pam enable)"; fi
   echo "recent driver log:"
   local lg
   lg="$(journalctl -u fprintd -b --no-pager -o cat 2>/dev/null | grep -E 'goodix550c (open|attempt):' | tail -n 10 || true)"
@@ -203,6 +257,50 @@ cmd_psk_backup() {
   echo "backed up to $dest (mode 0600; keep it off-repo and off-cloud)"
 }
 
+# make the pam_fprintd line in common-auth carry the same max-tries/timeout as the profile
+# (pam-auth-update carries hand-edited values forward into the generated line)
+pam_normalize_common_auth() {
+  local want_t want_o
+  want_t="$(grep -o 'max-tries=[0-9]*' "$PAM_PROFILE" 2>/dev/null | head -1 || true)"
+  want_o="$(grep -o 'timeout=[0-9]*' "$PAM_PROFILE" 2>/dev/null | head -1 || true)"
+  want_t="${want_t:-max-tries=3}"
+  sed -i "/pam_fprintd\.so/ s/max-tries=[0-9]*/$want_t/" "$COMMON_AUTH"
+  if [ -n "$want_o" ]; then sed -i "/pam_fprintd\.so/ s/timeout=[0-9]*/$want_o/" "$COMMON_AUTH"; fi
+}
+
+pam_set() {
+  local tries="" timeout="" cur_t cur_o
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tries) tries="${2:-}"; shift; [ $# -eq 0 ] || shift ;;
+      --timeout) timeout="${2:-}"; shift; [ $# -eq 0 ] || shift ;;
+      *) die "usage: goodix550c-ctl pam set --tries N --timeout S" ;;
+    esac
+  done
+  [ -n "$tries" ] || [ -n "$timeout" ] || die "usage: goodix550c-ctl pam set --tries N --timeout S"
+  read -r cur_t cur_o < <(pam_values)
+  if [ -z "$tries" ]; then tries="$cur_t"; fi
+  if [ -z "$timeout" ]; then timeout="$cur_o"; fi
+  case "$tries" in [1-5]) ;; *) die "--tries must be a whole number from 1 to 5 (got '$tries')" ;; esac
+  case "$timeout" in
+    [5-9]|[12][0-9]|30) ;;
+    *) die "--timeout must be a whole number of seconds from 5 to 30 (got '$timeout')" ;;
+  esac
+  [ -f "$PAM_PROFILE" ] || die "PAM profile missing: ${PAM_PROFILE#"$R"} (reinstall $PKG)"
+  mkdir -p "$PSK_DIR"
+  printf 'TRIES=%s\nTIMEOUT=%s\n' "$tries" "$timeout" > "$PAM_CONF"
+  chmod 600 "$PAM_CONF"
+  sed -i "/pam_fprintd\.so/ { s/max-tries=[0-9]*/max-tries=$tries/; s/timeout=[0-9]*/timeout=$timeout/; }" "$PAM_PROFILE"
+  echo "saved: tries=$tries timeout=${timeout}s (${PAM_CONF#"$R"})"
+  if pam_profile_enabled; then
+    [ ! -f "$COMMON_AUTH" ] || pam_normalize_common_auth
+    pam-auth-update --force --enable "$PROFILE"
+    echo "applied to the PAM stack"
+  else
+    echo "PAM profile is not enabled; values will apply when you run: sudo goodix550c-ctl pam enable"
+  fi
+}
+
 cmd_pam() {
   need_root pam
   case "${1:-}" in
@@ -211,14 +309,13 @@ cmd_pam() {
         # pam-auth-update would carry a hand-edited max-tries into the generated line
         mkdir -p "$R/var/backups/goodix550c"
         cp -a "$COMMON_AUTH" "$R/var/backups/goodix550c/common-auth.$(date +%Y%m%d%H%M%S)"
-        want="$(grep -o 'max-tries=[0-9]*' "$PAM_PROFILE" 2>/dev/null | head -1 || true)"
-        want="${want:-max-tries=3}"
-        sed -i "/pam_fprintd\.so/ s/max-tries=[0-9]*/$want/" "$COMMON_AUTH"
+        pam_normalize_common_auth
       fi
       # --force: the sandboxed run (WP2) showed the generated stack is correct once max-tries is normalized
       pam-auth-update --force --disable fprintd --enable "$PROFILE" ;;
     disable) pam-auth-update --disable "$PROFILE" ;;
-    *) die "usage: goodix550c-ctl pam enable|disable" ;;
+    set) shift; pam_set "$@" ;;
+    *) die "usage: goodix550c-ctl pam enable|disable|set --tries N --timeout S" ;;
   esac
 }
 
@@ -278,7 +375,7 @@ main() {
   local c="${1:-}"
   [ $# -eq 0 ] || shift
   case "$c" in
-    status) cmd_status ;;
+    status) cmd_status "$@" ;;
     doctor) cmd_doctor ;;
     recover) cmd_recover ;;
     enroll) cmd_enroll "$@" ;;
