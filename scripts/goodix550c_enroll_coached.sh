@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Coached enrollment: one short placement instruction per stage so the stored
-# samples cover the whole finger (centre, tip, base, both edges, corners).
+# Coached enrollment: one short placement instruction per stage.
 #
 #   goodix550c_enroll_coached.sh [slot]     (default slot: right-index-finger)
 #   REPLACE=1 goodix550c_enroll_coached.sh  delete that slot first, then enroll
@@ -13,11 +12,23 @@ set -uo pipefail
 
 SLOT="${1:-right-index-finger}"
 TIMEOUT="${ENROLL_TIMEOUT:-240}"
+# COACH=natural (default): your everyday touch with small shifts. Round r2 showed
+# that wide coaching (rolls, tips) stores samples everyday touches never match:
+# 11/12 matches hit one single sample, with lower scores than a natural enrollment.
+# COACH=wide keeps the old centre/tip/base/roll pattern.
+if [[ "${COACH:-natural}" == wide ]]; then
 PLACES=(middle middle fingertip fingertip "lower part of finger" "lower part of finger"
         "roll LEFT" "roll LEFT" "roll RIGHT" "roll RIGHT" "tip, roll left" "tip, roll right"
         "low, roll left" "low, roll right" middle fingertip "lower part of finger" "roll LEFT"
         "roll RIGHT" middle "tip, roll left" "tip, roll right" "low, roll left" "low, roll right"
         middle middle middle middle middle middle)
+else
+PLACES=(normal normal normal "normal, a bit higher" "normal, a bit lower" normal
+        "normal, a bit left" "normal, a bit right" normal "normal, a bit higher" "normal, a bit lower" normal
+        "normal, slightly tilted" normal "normal, a bit left" "normal, a bit right" normal normal
+        "normal, a bit higher" "normal, a bit lower" normal normal normal normal
+        normal normal normal normal normal normal)
+fi
 
 BOLD="$(tput bold 2>/dev/null || true)"; NORM="$(tput sgr0 2>/dev/null || true)"
 say() { printf '%s%s%s\n' "$BOLD" "$1" "$NORM"; }
@@ -33,7 +44,7 @@ if fprintd-list "$USER" 2>/dev/null | grep -q -- "- #[0-9]*: $SLOT\$"; then
 fi
 
 say "=== Enroll RIGHT INDEX into slot '$SLOT' ==="
-echo "    Each time it says TOUCH NOW, put the finger where it says, hold ~1 sec, lift."
+echo "    Touch the way you normally would. Small shifts when it asks. Hold ~1 sec, lift."
 stage=0 result=fail
 while IFS= read -r line; do
     case "$line" in
