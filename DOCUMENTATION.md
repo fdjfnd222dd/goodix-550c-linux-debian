@@ -1415,3 +1415,261 @@ after the device had already seen the finger leave; and a `SIGSEGV` at process e
 where global destructors ran beside unjoinable OpenCV worker threads. Patches `0006`
 and `0007` were likewise generated from the pinned base, and the extended
 `driver-series` again reapplies byte-identically.
+
+## Debian reliability work (2026-10-17)
+
+The Ubuntu record above ends with a working but hand-assembled setup. On Debian 13
+(trixie, kernel 6.12, KDE/SDDM, `libfprint-2-2 1:1.94.10+goodix550c`, `fprintd`
+and `libpam-fprintd` 1.94.5-2) the same driver worked but was fragile in four ways,
+and the machine's login depended on files nobody owned: a hand-edited
+`/etc/pam.d/common-auth`, a local `/etc/pam.d/kde`, two fprintd drop-ins under
+`/etc/systemd/system`, a sleep hook, a TLP denylist, an unstick probe in `/opt` and a
+set of scripts in the home directory. The work, in dependency order: a build that is
+versioned and never overwritten, timing-neutral measurement, a PAM profile, the
+stale-TLS open fix, the finger-present capture fixes, and two packages. The plan is
+`PLAN.md`; the measurement protocol and results are `docs/measurements.md`; recovery
+is `docs/RECOVERY.md`.
+
+The safety rules did not move. The deny list (`A4`, `E0`, `E2`, `F0`, `F4`) is
+unchanged, volatile operations still need the build flag and the runtime variable,
+manual FDT is still double-gated, only firmware 13021 is accepted, the self-heal
+block stays `#if 0`, the PSK stays external and is wiped on every path, no key,
+frame or template is ever logged, every wait is bounded, and the match threshold
+stays at 150.
+
+### Measurement without changing the thing measured (patch 0015)
+
+`G_MESSAGES_DEBUG` was the only source of per-attempt numbers, and enabling it makes
+the matcher score every enrolled sample instead of stopping at the first match, so
+the timing under test changed with the instrument. Patch 0015 adds two `g_message`
+lines, gated by `GOODIX550C_LOG_SUMMARY=1` and read once at device open: one per open
+(`result`, total ms, `phase` reached, `drain_bytes`, `tls_retry`) and one per attempt
+(ready-to-finger-down ms, down polls, settle ms, reference mean, reference retries,
+non-contact fraction x1000, keypoints, best score, whether the matcher exited early,
+threshold, result, and two signed-delta figures that are log-only). Every field is an
+integer and the only strings are fixed literals from a table. The patch records values
+the flow already computes; it adds no branch and changes no wait or return value.
+`scripts/goodix550c_score_report.py` reads those lines, split on markers written by
+`scripts/goodix550c_session.sh`, and `docs/measurements.md` gives the protocol (B1 to
+B6) and the target for each. A change is accepted only if the same protocol shows it
+beats the previous build.
+
+### Stale TLS on open (patch 0016)
+
+**Symptom.** After `fprintd` was killed or the machine resumed from sleep, the next
+open failed the TLS handshake with a provider cipher error. That reads exactly like a
+wrong key or a broken build, and the sensor stayed unusable until a manual read-only
+probe had been run.
+
+**Cause.** A sensor left mid-session can hold unread bytes on its IN endpoint, or a
+half-open TLS session. The handshake then fails; the exact internal
+mechanism was not traced further, only that draining and waking the sensor first
+cures it. The probe that cured it worked because it drained the
+endpoint (`usb_probe.py`'s pre-existing-data loop) and woke the sensor with a NOP
+before doing anything else. The earlier workaround was an `ExecStartPre` unstick
+probe in `/opt` plus a sleep hook, which fixed the symptom outside the driver.
+
+**Design.** The open state machine now does what the probe did:
+
+1. `GOODIX_OPEN_DRAIN`, right after the interface claim: at most 16 IN reads with a
+   30 ms timeout, data discarded, stop at the first timeout, bytes counted for the
+   summary line (`GOODIX_550C_DRAIN_MAX_READS`, `GOODIX_550C_DRAIN_TIMEOUT_MS`). The
+   read chunk is larger than any bulk packet, so it cannot overflow.
+2. `GOODIX_OPEN_550C_PSK_HASH` and `_PSK_CHECK`, after the OTP and before TLS: send
+   `0xE4` with the 16-byte payload that is byte-identical to `READ_PSK_HASH_PAYLOAD`
+   in `protocol.py` (length 32, offset 0, flags `0xbb020001`), require the exact reply
+   layout the probe requires, and compare the 32-byte hash with SHA-256 of the loaded
+   PSK using `CRYPTO_memcmp`. A wrong key now fails the open once, closed, as "PSK
+   mismatch", with no retry. Neither hash is ever logged. `0xE4` is a read; the deny
+   list is unchanged and now carries a comment saying why `0xE4` is not on it while
+   `E0` and `E2` (writes) are.
+3. One handshake retry (`GOODIX_550C_TLS_MAX_RETRIES = 1`). If the TLS pump fails or
+   the sensor stays silent during the handshake, the TLS context and receive buffer
+   are freed, the PSK is read again, and the open resumes at DRAIN, PING, PSK_HASH,
+   PSK_CHECK, TLS_INIT. A second failure fails the open exactly as before. There is
+   no USB reset in the retry and no loop.
+4. The 0015 open line reports the real `drain_bytes` and `tls_retry`, and a new phase
+   `psk`.
+
+The open-recovery counters are reset at `USB_RESET`, the first state of every open.
+The intent is that `tls_retry > 0` appears only in the kill and resume cases, and
+that those open successfully; the workarounds (unstick drop-in and sleep hook) are
+archived as manual tools only once the A/B shows that (`docs/measurements.md`).
+
+### Finger present at start (patches 0017 and 0018)
+
+**Symptom.** "Remove your finger" loops, genuine attempts scoring as a stranger's,
+and PAM retries that made it worse.
+
+**Cause.** The reference frame is the no-finger image that is subtracted from every
+capture. A finger baked into it erases that finger from the probe. Three routes put
+one there:
+
+- The pre-reference clear check only asked that two consecutive manual FDT readings
+  agree with each other. A finger resting still agrees with itself, so it was adopted
+  as the "no-finger" baseline.
+- A finger could arrive while the reference itself was being read. An empty pad
+  averages about 2350 and a finger-covered one far less (1490 to 1600 in the
+  observations that motivated the constant).
+- A no-match was reported before the finger lifted, so the caller's next claim (a PAM
+  retry, or the lock screen's three tries) started with the finger still down.
+
+**Design, 0017.** Verify and identify compare every poll of the pre-reference phase
+with the last confirmed-empty baseline using the finger-down threshold, require
+`GOODIX_CLEAR_CONSECUTIVE_POLLS` (2) clear polls in a row, and give up after
+`GOODIX_CLEAR_WINDOW_MAX_MS` (3000 ms) with a remove-finger retry. Because real
+baseline drift could look like a finger forever, the third refusal in a row
+(`GOODIX_CLEAR_REJECT_ADOPT_AFTER`) adopts the reading anyway; the reference-mean
+check below remains the guard. The post-reference phase is left alone: its baseline is
+expected to move when image mode is switched off. A reference whose mean is below
+`GOODIX_REF_FINGER_MEAN_MAX` (2000) is treated as finger-present, is never stored, and
+is retried inside the existing 60 x 250 ms budget, capped separately at
+`GOODIX_REFERENCE_FINGER_MAX_RETRIES` (16); on exhaustion verify and identify end with
+a remove-finger retry and enrollment fails as it did for the no-signal case. A
+no-match result is held back for at most `GOODIX_RESULT_FINGER_UP_WAIT_MS` (1500 ms)
+while the finger-up poll runs, so the next claim does not start with the finger down.
+This applies to the manual-FDT wait only. The summary line gains `clear_ms`,
+`clear_dev_polls`, `clear_rejects`, `up_wait_ms`, `up_first` and the result
+`retry:finger-present`. A retry raised by the state machine is now delivered through
+the verify/identify report, because libfprint does not accept a retry error from the
+completion call.
+
+**Design, 0018.** A verify or identify probe whose non-contact fraction exceeds
+`GOODIX_VERIFY_NO_CONTACT_FRACTION` (0.90, the same constant patch 0010 uses for
+enrollment) means the finger had already left the pad when the frame was read. It is
+answered with `FP_DEVICE_RETRY_TOO_SHORT` before feature extraction or scoring, and
+the finger-up wait is skipped for that attempt. Reported as `retry:too-short`.
+
+Open item: the plan intended `GOODIX_REF_FINGER_MEAN_MAX` to be derived from the
+measured split of reference means (midpoint, with at least 150 margin on each side).
+The patch ships the fixed 2000; the derivation is a TODO in `docs/measurements.md`.
+Signed deltas stay log-only, and the threshold is unchanged.
+
+### PAM design
+
+**Goal.** `sudo` and polkit try the finger once, then fall back to the password
+quickly. The KDE lock screen reaches the fingerprint only through KDE's own
+`kde-fingerprint` service. Neither may leave the password path dependent on the
+sensor, and the configuration must survive `pam-auth-update`.
+
+**Why the old setup was slow.** `pam-auth-update` puts the fprintd stanza in
+`common-auth`, which every service includes. With the vendor `kde-fingerprint` service
+claiming the device as well, the lock screen failed with "Device was already claimed",
+and every `sudo` and polkit action waited the full fingerprint timeout (22 to 30 s
+with retries) before the password prompt. This is the same scope error recorded above
+in "`common-auth` was the wrong place", now with a retry multiplier.
+
+**Profile.** `/usr/share/pam-configs/goodix550c-fingerprint` (`Default: no`, priority
+260, `Conflicts: fprintd`):
+
+```text
+[success=1 default=ignore]   pam_succeed_if.so service in kde:kde-fingerprint:sddm:sddm-greeter:login quiet
+[success=end default=ignore] pam_fprintd.so max-tries=1 timeout=15
+```
+
+- The skip list sends the lock screen (`kde`, `kde-fingerprint`), the display manager
+  (`sddm`, `sddm-greeter`) and text login (`login`) past the fingerprint line, so only
+  `sudo`, polkit and similar services use it. `kde-fingerprint` was added to the list
+  after the first design pass: the vendor `kde-fingerprint` service has its own
+  `pam_fprintd` line, so letting the `common-auth` line run for it as well claims the
+  device twice.
+- `default=ignore` on both lines: any failure, timeout or missing device continues to
+  the password module. Nothing is `required` or `requisite`, so the profile cannot
+  lock the account out.
+- `max-tries=1`: a failed attempt reported by the module is followed by a retry that
+  starts while the finger is still down, which is the third route above. One try, then
+  password.
+- `timeout=15`: covers the roughly 11 s window after sleep in which the sensor returns
+  blank reference frames (see the Ubuntu record), with margin. Revisit to 10 once the
+  capture guards are measured.
+- `Default: no`: installing the package registers the profile but does not enable it.
+  `goodix550c-ctl pam enable` is the opt-in; `pam disable` and `pam-auth-update
+  --disable goodix550c-fingerprint` reverse it. The package never writes
+  `/etc/pam.d/*` itself.
+
+**Gotcha: local-edit carry-over.** `pam-auth-update` regenerates `common-auth` from
+the profiles, but it keeps a hand-edited line if the file was modified locally and
+you answer to keep it. A previous hand-set `pam_fprintd.so max-tries=...` (or
+`timeout=...`) therefore survives the regeneration and shows up in the generated
+file. `goodix550c-ctl pam enable` copies `common-auth` to
+`/var/backups/goodix550c/common-auth.<timestamp>`, normalises an existing
+`max-tries=` to `1`, and only then runs `pam-auth-update --disable fprintd --enable
+goodix550c-fingerprint`. After any PAM change, read the generated file and check the
+jump counts (`success=1` must still land on the module after the fingerprint line);
+the plan's fallback, if `pam-auth-update` rewrote the numeric jump, was to drop
+fprintd from `common-auth` and add it to `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`
+directly.
+
+**Procedure.** Keep `sudo -i` open in a second terminal tab while changing PAM, and
+confirm a text-console password login (Ctrl+Alt+F3) before closing it.
+
+### Packaging design
+
+Two packages, built by `scripts/build_goodix550c_debs.sh` into
+`~/goodix550c-debs/patched/` (outside Timeshift, so they survive a restore).
+
+**`libfprint-2-2` (`1:1.94.10+goodix550cN`, amd64).** Built from the stock Debian
+`1:1.94.9-1` deb (`dpkg-deb -R`, which keeps shlibs, symbols, triggers and docs) with
+the built `libfprint-2.so.2.0.0` swapped in. The builder refuses to overwrite an
+existing file and picks N as the highest existing plus one. It prepends a local
+changelog entry, writes `/usr/share/doc/libfprint-2-2/GOODIX550C-BUILD` (series
+sha256, git revision and dirty flag, library sha256, build date) and sets
+`Provides: libfprint-2-2 (= 1:1.94.10), libfprint-goodix550c (= N)`. The `usb:v27C6p550C`
+line is deleted from the shipped autosuspend hwdb: that file lists the sensor with
+`ID_AUTOSUSPEND=1`, which is what the udev rule and TLP denylist undo, and the dpkg-owned
+hwdb file is the wrong place for a device-specific override.
+
+**`goodix550c-fingerprint` (1.0.0, all).** `Depends: libfprint-goodix550c (>= 3),
+fprintd, libpam-fprintd, udev`; `Recommends: tlp`. Contents: the fprintd drop-in in
+`/usr/lib/systemd/system/fprintd.service.d/50-goodix550c.conf` (driver allow-list, the
+two runtime gates, `GOODIX550C_PSK_FILE`, `GOODIX550C_LOG_SUMMARY=1`, `UMask=0077`),
+`/usr/lib/udev/rules.d/60-goodix550c-power.rules` (power/control `on` for `27c6:550c`),
+the TLP denylist conffile, the PAM profile, `/usr/sbin/goodix550c-ctl`, and
+`/etc/apt/preferences.d/goodix550c-libfprint`. The PSK is never in a package, and the
+maintainer scripts never touch it, the print store, or `/etc/pam.d`.
+
+- **Pin and hold.** The hold stops `apt upgrade` replacing the library. The pin
+  (`1:1.94.10+goodix550c*`, priority 1001) beats Debian's candidate (`1:1.94.9-1`)
+  and survives an `apt-mark unhold`. A hold alone is lost whenever the dpkg database
+  is rolled back; the `libfprint-goodix550c` dependency makes the config package
+  unsatisfiable (apt would remove it) if the stock library were ever swapped in.
+  `goodix550c-ctl status` flags a missing hold or pin.
+- **preinst, fresh install only.** Unowned legacy files (the old `10-`, `20-`,
+  `40-goodix550c*.conf` drop-ins under `/etc/systemd/system/fprintd.service.d`, the
+  unstick script, the system-sleep hook, `/opt/goodix550c-probe`, and an unowned TLP
+  file) are moved to `/var/backups/goodix550c-legacy/` so the packaged copies take over
+  without dpkg conffile prompts. Files that dpkg already owns are left alone.
+- **postinst** reloads systemd and udev, re-triggers the device, restarts fprintd and
+  runs `pam-auth-update --package`, which registers the profile only. **prerm**
+  (`remove`) unregisters the profile. **postrm** reloads and leaves `/etc/goodix550c`
+  and `/var/lib/fprint` alone even on purge.
+- **Hwdb autosuspend.** Removed from the library package as above; handled by the udev
+  rule and TLP instead.
+
+`goodix550c-ctl` (`status`, `doctor`, `recover`, `enroll`, `install-psk`,
+`psk-backup`, `harden-store`, `pam enable|disable`, `rollback-stock`) replaces the
+home-directory scripts. `GOODIX550C_ROOT=<dir>` redirects its paths for the tests.
+`install-psk` accepts 32 raw bytes or 64 hex characters and writes canonical hex,
+mode 0600, root-owned. `psk-backup` refuses repository, `/tmp` and existing
+destinations. `rollback-stock` disables the profile, unholds and removes the config
+package (and with it the pin), then installs the stock deb with downgrades allowed.
+
+**Secret scan.** `scripts/check_no_secrets.py` gates any push of the public
+repository. It derives the hex, base64 and SHA-256 forms of the files under
+`research/secrets`, scans the tracked files and `git log -p --all` for them, flags
+64-hex strings and private-key headers, flags tracked image, print and key-like
+files, and prints only the location and the kind of match, never a value.
+
+### Measurement method
+
+See `docs/measurements.md` for the full protocol and result tables. In brief: blocks
+B1 (genuine x20), B2 (finger on the pad at the start x10), B3 (impostor x10), B4
+(opens x50 with no touch), B5 (`sudo` x10) and B6 (suspend and lock-screen unlock) are
+driven by `scripts/goodix550c_session.sh`, which brackets each touch with a journal
+marker. The driver's integer summary lines supply the per-attempt facts, and
+`scripts/goodix550c_score_report.py` aggregates them per label into first-try and
+within-two rates, retry-reason histograms, score distributions, impostor maximum,
+open failures by phase and median open time, with `--json` for build-to-build diffs.
+The baseline is the build that adds only the summary lines; each later patch is
+installed as its own versioned deb and judged alone against it. No results are
+recorded here yet.

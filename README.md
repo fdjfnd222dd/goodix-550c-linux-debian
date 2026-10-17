@@ -39,6 +39,52 @@ There are three deliberately separated layers:
   `libfprint 1.95.1+tod1` runtime. It leaves Ubuntu's core library and `fprintd`
   untouched and has a private-D-Bus smoke mode in which USB is not visible.
 
+## Debian 13 (trixie)
+
+A separate, packaged path for Debian 13 on amd64 (developed on a Lenovo Yoga 9
+14IAP7, kernel 6.12, KDE/SDDM). It does not use the Ubuntu TOD module: trixie has no
+TOD-capable libfprint, so it ships a replacement `libfprint-2-2`
+(`1:1.94.10+goodix550cN`) built from the same driver patch series.
+
+- **Supported:** sensor `27c6:550c` with firmware `GF5288_GM168SEC_APP_13021` only
+  (any other firmware is refused by design). It needs the pre-shared key (PSK) from
+  the Windows install that originally paired the sensor; see
+  [docs/DEBIAN-INSTALL.md](docs/DEBIAN-INSTALL.md).
+- **Two packages:** `libfprint-2-2` (the patched library; it `Provides:
+  libfprint-goodix550c`; held and pinned so updates do not replace it) and
+  `goodix550c-fingerprint` (fprintd drop-in, udev power rule, TLP denylist, an
+  opt-in `pam-auth-update` profile, apt pin, and the `goodix550c-ctl` helper). The
+  PSK is never in a package.
+- **Quick start**, after installing both debs and holding the library
+  (`sudo apt-mark hold libfprint-2-2`):
+
+```bash
+sudo goodix550c-ctl install-psk /path/to/goodix550c.psk
+goodix550c-ctl doctor
+goodix550c-ctl enroll right-index-finger
+sudo goodix550c-ctl pam enable
+```
+
+  `goodix550c-ctl status` shows what is missing and why. The PAM profile applies to
+  `sudo` and polkit only; the KDE lock screen keeps using KDE's own
+  `kde-fingerprint` service, and the display-manager login is left alone. A missing
+  or failing sensor always falls through to the password prompt.
+- **When something breaks** (Timeshift restore, update, bad PAM change): see
+  [docs/RECOVERY.md](docs/RECOVERY.md). Measurement method and results:
+  [docs/measurements.md](docs/measurements.md). Design rationale:
+  [DOCUMENTATION.md](DOCUMENTATION.md#debian-reliability-work-2026-10-17).
+
+This path supersedes the author's earlier hand-made home-directory scripts
+(`~/*.sh` for installing, re-packaging and enrolling), hand-edited
+`/etc/pam.d/common-auth` and `/etc/pam.d/kde`, local fprintd drop-ins and the sleep
+hook. `goodix550c-ctl` and the packages replace them; installing
+`goodix550c-fingerprint` moves any leftover legacy files to
+`/var/backups/goodix550c-legacy/`.
+
+The "Status and safety" notes below describe the Ubuntu research run, which was
+removed afterwards. The Debian path is meant to stay installed, and carries the
+same research-grade caveats.
+
 ## Status and safety
 
 **Nothing here is installed or running on the author's machine.** The driver was
