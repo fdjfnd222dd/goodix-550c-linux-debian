@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Guided fingerprint measurement blocks (user level; no sudo except B5's own prompt).
+#
+#   goodix550c_session.sh b1|b2|b3|b4|b5|b6|all|report [name]
+#
+# Every run is bracketed by journal markers (logger -t goodix550c-session) that
+# scripts/goodix550c_score_report.py uses to split the fprintd journal by label.
+# Needs GOODIX550C_LOG_SUMMARY=1 in the fprintd service for the per-attempt lines.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/goodix550c-session"
+START_FILE="$STATE_DIR/start"
+FINGER="${FINGER:-right-index}"
+IMPOSTOR_FINGER="${IMPOSTOR_FINGER:-left-index}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-30}"
+RUN_COUNTER=0
+TAG=goodix550c-session
+
+mkdir -p "$STATE_DIR"
+
+mark_start_time() {
+    [[ -s "$START_FILE" ]] || date '+%F %T' > "$START_FILE"
+}
+
+next_run() {
+    RUN_COUNTER=$((RUN_COUNTER + 1))
+    RUN_ID="$(date +%H%M%S)-$1-$RUN_COUNTER"
+}
+
+marker_start() { logger -t "$TAG" "label=$1 finger=$2 run=$RUN_ID"; }
+marker_end() { logger -t "$TAG" "end run=$RUN_ID${1:+ result=$1}"; }
+
+ask() {
+    # ask "prompt" ; returns when the human presses Enter
+    local reply
+    read -r -p "$1 " reply || exit 1
+}
+
+verify_once() {
+    local out rc
+    out="$(timeout "$VERIFY_TIMEOUT" fprintd-verify -f any "$USER" 2>&1)"
+    rc=$?
+    printf '   -> %s\n' "$(printf '%s\n' "$out" | grep -E 'Verify result' | tail -1 | sed 's/^ *//')"
+    ((rc == 124)) && echo "   -> timed out after ${VERIFY_TIMEOUT}s"
+    return 0
+}
+
+touch_block() {
+    # touch_block <label> <finger> <count> <prompt>
+    local label="$1" finger="$2" count="$3" prompt="$4" i
+    mark_start_time
+    echo "== $label x$count =="
+    for ((i = 1; i <= count; i++)); do
+        ask "[$i/$count] $prompt Press Enter:"
+        next_run "$label"
+        marker_start "$label" "$finger"
+        echo "   Touch when it says 'Place your finger'."
+        verify_once
+        marker_end
+    done
+}
+
+b1() { touch_block genuine "$FINGER" 20 "Lift your finger fully. Then Enter, and touch ($FINGER) after the prompt."; }
+b2() { touch_block present-at-start "$FINGER" 10 "Rest your finger ($FINGER) on the pad NOW and keep it there, then"; }
+b3() { touch_block impostor "$IMPOSTOR_FINGER" 10 "Use $IMPOSTOR_FINGER (not enrolled). Lift first, then"; }
+
+b4() {
+    mark_start_time
+    echo "== opens x50 (do NOT touch the sensor; ~4 min) =="
+    next_run opens
+    marker_start opens none
+    local i
+    for ((i = 1; i <= 50; i++)); do
+        timeout -s INT 5 fprintd-verify -f any "$USER" >/dev/null 2>&1
+        printf '\r   %d/50' "$i"
+    done
+    echo
+    marker_end
+}
+
+b5() {
+    mark_start_time
+    echo "== sudo x10 (touch when it waits, or type the password) =="
+    local i t0 t1
+    for ((i = 1; i <= 10; i++)); do
+        ask "[$i/10] Lift your finger. Enter, then touch when sudo waits:"
+        next_run sudo
+        marker_start sudo "$FINGER"
+        t0=$(date +%s.%N)
+        sudo -k && sudo true
+        t1=$(date +%s.%N)
+        printf '   -> sudo finished in %.1fs\n' "$(echo "$t1 - $t0" | bc)"
+        marker_end
+    done
+}
+
+b6() {
+    mark_start_time
+    echo "== suspend/resume x5 =="
+    local i answer
+    for ((i = 1; i <= 5; i++)); do
+        echo "[$i/5] Suspend now (Meta menu > Sleep), wake it, unlock the lock screen with your finger."
+        next_run suspend
+        marker_start suspend "$FINGER"
+        while :; do
+            read -r -p "   Did finger unlock work within 2 tries? (pass/fail): " answer || exit 1
+            case "$answer" in pass|fail) break ;; esac
+        done
+        marker_end "$answer"
+    done
+}
+
+report() {
+    local name="${1:-session}" since out_dir json py
+    since="${SINCE:-$(cat "$START_FILE" 2>/dev/null || true)}"
+    [[ -n "$since" ]] || { echo "No session start recorded; run a block first or set SINCE='YYYY-MM-DD HH:MM:SS'." >&2; exit 1; }
+    out_dir="$ROOT/research/baseline"
+    mkdir -p "$out_dir"
+    json="$out_dir/$(date +%F)-$name.json"
+    py="$ROOT/.venv/bin/python"
+    [[ -x "$py" ]] || py=python3
+    local log
+    log="$(mktemp)"
+    trap 'rm -f "$log"' RETURN
+    journalctl --no-pager -o short-iso --since "$since" _SYSTEMD_UNIT=fprintd.service + SYSLOG_IDENTIFIER="$TAG" > "$log"
+    "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log"
+    "$py" "$ROOT/scripts/goodix550c_score_report.py" --log "$log" --json > "$json" && echo "JSON saved: $json"
+}
+
+case "${1:-}" in
+    b1) b1 ;;
+    b2) b2 ;;
+    b3) b3 ;;
+    b4) b4 ;;
+    b5) b5 ;;
+    b6) b6 ;;
+    all) rm -f "$START_FILE"; b1; b2; b3; b4; b5; b6; report "${2:-all}" ;;
+    report) report "${2:-session}" ;;
+    *)
+        echo "Usage: $0 b1|b2|b3|b4|b5|b6|all|report [name]" >&2
+        echo "  b1 genuine x20, b2 finger-on-pad-first x10, b3 impostor x10, b4 opens x50," >&2
+        echo "  b5 sudo x10, b6 suspend x5. Env: FINGER, IMPOSTOR_FINGER, SINCE, VERIFY_TIMEOUT." >&2
+        exit 2
+        ;;
+esac

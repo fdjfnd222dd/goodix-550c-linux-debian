@@ -12,3 +12,4 @@
 0012-goodix550c-size-reference-retry-to-blackout.patch
 0013-goodix550c-keep-sensor-awake-between-enroll-stages.patch
 0014-goodix550c-stop-openssl-installing-an-atexit-handler.patch
+0015-goodix550c-log-attempt-summary.patch
