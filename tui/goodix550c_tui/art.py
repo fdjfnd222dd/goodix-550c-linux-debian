@@ -4,7 +4,9 @@ screenshot."""
 from __future__ import annotations
 
 import math
+import textwrap
 from functools import lru_cache
+from typing import NamedTuple
 
 from rich.text import Text
 
@@ -25,13 +27,10 @@ ORANGE = "#ff9f1c"
 RED = "#ff5c5c"
 CYAN = "#39c5cf"
 BLUE = "#4ea1ff"
-PURPLE = "#bc8cff"
-YELLOW = "#f2cc60"
 GREY = "#8b93a0"
 
 # panel border colours (ctop uses the same ones)
-B_BLUE, B_GREEN, B_GOLD, B_PURPLE, B_ROSE, B_CYAN = (
-    "#4f8fd6", "#5fa86b", "#d9a441", "#bc8cff", "#c0627a", "#39c5cf")
+B_BLUE, B_GREEN, B_GOLD, B_PURPLE, B_CYAN = ("#4f8fd6", "#5fa86b", "#d9a441", "#bc8cff", "#39c5cf")
 
 STATE_COLOUR = {
     "idle": FG,
@@ -52,6 +51,7 @@ def _rgb(c: str) -> tuple[int, int, int]:
     return int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
 
 
+@lru_cache(maxsize=4096)
 def blend(a: str, b: str, t: float) -> str:
     """Colour a -> b by t (0..1)."""
     t = min(max(t, 0.0), 1.0)
@@ -104,7 +104,6 @@ def hcat(cols: list[list[Text]], widths: list[int], gap: int = 2) -> list[Text]:
 
 
 def wrap(text: str, width: int, style: str = FG) -> list[Text]:
-    import textwrap
     return [Text(s, style=style, no_wrap=True) for s in textwrap.wrap(text, max(width, 10))] or [Text()]
 
 
@@ -350,7 +349,7 @@ def score_columns(items: list[tuple[int | None, str]], width: int, rows: int,
     labels = [" " * gut] * rows
 
     def row_of(v):
-        return rows - 1 - int(score_pos(v) * rows * 8 // 8)
+        return rows - 1 - int(score_pos(v) * rows)
 
     for v, lab in ((10000, "10k"), (1000, "1k"), (threshold, str(threshold))):
         r = row_of(v)
@@ -386,22 +385,32 @@ def score_columns(items: list[tuple[int | None, str]], width: int, rows: int,
 # --------------------------------------------------------------------------
 # Hands: solid rounded fingers on a palm, the chosen one lit
 # --------------------------------------------------------------------------
-FW = 6              # finger width
-GAP = 1
-HAND_W = 5 * FW + 4 * GAP
-HAND_GAP = 4
-HANDS_W = HAND_W * 2 + HAND_GAP
+class HandSpec(NamedTuple):
+    """Geometry of the two hands: finger width, gap, first row of each finger (left hand, little ...
+    thumb), last finger row, palm rows, gap between the hands."""
+    fw: int
+    gap: int
+    tops: tuple[int, ...]
+    bottom: int
+    palm: int
+    hand_gap: int
+
+    @property
+    def hand_w(self) -> int:
+        return 5 * self.fw + 4 * self.gap
+
+    @property
+    def width(self) -> int:
+        return self.hand_w * 2 + self.hand_gap
+
+    @property
+    def height(self) -> int:
+        return self.bottom + 1 + self.palm
+
+
+HANDS_SMALL = HandSpec(fw=6, gap=1, tops=(3, 1, 0, 1, 4), bottom=7, palm=2, hand_gap=4)
+HANDS_BIG = HandSpec(fw=9, gap=1, tops=(5, 2, 0, 2, 8), bottom=13, palm=3, hand_gap=6)   # roomy screens
 SHORT = {"thumb": "thumb", "index": "index", "middle": "mid", "ring": "ring", "little": "pinky"}
-# first row of each finger, in left-to-right order of the LEFT hand (little ... thumb)
-TOPS_LEFT = [3, 1, 0, 1, 4]
-FINGER_BOTTOM = 7    # last finger row (palm starts below)
-PALM_ROWS = 2
-HAND_H = FINGER_BOTTOM + 1 + PALM_ROWS
-# the big hands (roomy screens): wider and taller fingers
-BIG = dict(fw=9, gap=1, tops=[5, 2, 0, 2, 8], bottom=13, palm=3, hand_gap=6)
-BIG_HAND_W = 5 * BIG["fw"] + 4 * BIG["gap"]
-BIG_HANDS_W = BIG_HAND_W * 2 + BIG["hand_gap"]
-BIG_HAND_H = BIG["bottom"] + 1 + BIG["palm"]
 FINGER_BG = "#1d2430"
 SAVED_BG = "#173a24"
 PALM_BG = "#161c25"
@@ -412,20 +421,16 @@ def _short(finger: str) -> str:
 
 
 def hands_size(big: bool = False) -> tuple[int, int]:
-    return (BIG_HANDS_W, BIG_HAND_H) if big else (HANDS_W, HAND_H)
+    spec = HANDS_BIG if big else HANDS_SMALL
+    return spec.width, spec.height
 
 
 def hands_lines(enrolled: set[str] | frozenset[str], selected: str | None,
                 accent: str = BLUE, big: bool = False) -> list[Text]:
     """Two hands side by side, saved fingers green with a dot, the selected finger lit."""
-    if big:
-        fw, gap, tops0, bottom, palm, hgap = (BIG["fw"], BIG["gap"], BIG["tops"], BIG["bottom"],
-                                               BIG["palm"], BIG["hand_gap"])
-    else:
-        fw, gap, tops0, bottom, palm, hgap = FW, GAP, TOPS_LEFT, FINGER_BOTTOM, PALM_ROWS, HAND_GAP
-    hand_w = 5 * fw + 4 * gap
-    width = hand_w * 2 + hgap
-    height = bottom + 1 + palm
+    spec = HANDS_BIG if big else HANDS_SMALL
+    fw, gap, bottom, palm, hgap = spec.fw, spec.gap, spec.bottom, spec.palm, spec.hand_gap
+    hand_w, width, height = spec.hand_w, spec.width, spec.height
     grid = [[" "] * width for _ in range(height)]
     styles: list[list[str | None]] = [[None] * width for _ in range(height)]
 
@@ -435,8 +440,8 @@ def hands_lines(enrolled: set[str] | frozenset[str], selected: str | None,
                 grid[y][x + i] = ch
                 styles[y][x + i] = st
 
-    hands = [(0, FINGERS_LEFT, tops0, "LEFT HAND"),
-             (hand_w + hgap, FINGERS_RIGHT, tops0[::-1], "RIGHT HAND")]
+    hands = [(0, FINGERS_LEFT, spec.tops, "LEFT HAND"),
+             (hand_w + hgap, FINGERS_RIGHT, spec.tops[::-1], "RIGHT HAND")]
     for x0, fingers, tops, label in hands:
         for i, (f, top) in enumerate(zip(fingers, tops)):
             x = x0 + i * (fw + gap)

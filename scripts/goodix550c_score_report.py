@@ -37,6 +37,7 @@ import json
 import re
 import statistics
 import sys
+from collections import Counter
 from pathlib import Path
 
 BEST_RE = re.compile(r"(?:Verify|Identify) best SIGFM score:\s*(\d+)\s*\(best_min:\s*(\d+)\)")
@@ -185,21 +186,18 @@ def summarise_label(label: str, sections: list[Section]) -> dict:
     within_two = sum(1 for run in scored_runs
                      if any(a.get("result") == "match" for a in run[:2]))
 
-    reasons: dict[str, int] = {}
-    for attempt in all_attempts:
-        result = str(attempt.get("result", ""))
-        if result.startswith("retry:"):
-            reasons[result[len("retry:"):]] = reasons.get(result[len("retry:"):], 0) + 1
+    reasons = Counter(
+        str(a.get("result", ""))[len("retry:"):]
+        for a in all_attempts
+        if str(a.get("result", "")).startswith("retry:")
+    )
 
     # Scores only count where the matcher actually ran.
     scores = [int(a["best_score"]) for a in all_attempts
               if a.get("result") in ("match", "no-match") and "best_score" in a]
     opens = [o for sec in sections for o in sec.opens]
-    open_failures: dict[str, int] = {}
-    for o in opens:
-        if o.get("result") == "fail":
-            phase = str(o.get("phase", "unknown"))
-            open_failures[phase] = open_failures.get(phase, 0) + 1
+    open_failures = Counter(str(o.get("phase", "unknown")) for o in opens
+                            if o.get("result") == "fail")
     open_ms = [int(o["ms"]) for o in opens if "ms" in o]
 
     out: dict = {
@@ -225,8 +223,7 @@ def summarise_label(label: str, sections: list[Section]) -> dict:
         out["manual_results"] = {"pass": manual.count("pass"), "fail": manual.count("fail")}
     if label == "impostor":
         out["impostor_max_score"] = max(scores) if scores else None
-        thresholds = [int(a["threshold"]) for a in all_attempts if a.get("threshold")]
-        if thresholds and scores:
+        if scores and any(a.get("threshold") for a in all_attempts):
             out["impostor_accepts"] = sum(1 for a in all_attempts if a.get("result") == "match")
     return out
 

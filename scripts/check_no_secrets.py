@@ -25,6 +25,12 @@ PRIVKEY = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 EMAIL = (b"richfern48" + b"@" + b"gmail.com")
 EMAIL_RE = re.compile(re.escape(EMAIL), re.I)
 STORE_PATH_MARKERS = ("var/lib/fprint", "research/secrets/")
+# Build provenance file shipped in our libfprint debs: the only 64-hex values accepted
+# in it are the two public sha256 lines the build script writes.
+PROVENANCE_FILE = "GOODIX550C-BUILD"
+PROVENANCE_LINE = re.compile(
+    r"^(driver-series sha256|libfprint-2\.so\.2\.0\.0 sha256): [0-9a-f]{64}$")
+BOUND_HASH = re.compile(r"^(?P<glob>.+):(?P<hash>[0-9a-fA-F]{64})$")
 
 
 class Usage(Exception):
@@ -32,20 +38,27 @@ class Usage(Exception):
 
 
 def load_allowlist(path: Path):
-    hashes, globs = set(), []
+    """-> (hashes valid anywhere, path globs for extension/path/FP3 exceptions,
+    [(glob, hash)] hashes valid only in files matching the glob)."""
+    hashes, globs, bound = set(), [], []
     if not path.is_file():
-        return hashes, globs
+        return hashes, globs, bound
     for line in path.read_text(errors="replace").splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
         if line.startswith("path:"):
-            globs.append(line[5:].strip())
+            spec = line[5:].strip()
+            m = BOUND_HASH.match(spec)
+            if m:
+                bound.append((m.group("glob"), m.group("hash").lower().encode()))
+            else:
+                globs.append(spec)
         elif re.fullmatch(r"[0-9a-fA-F]{64}", line):
             hashes.add(line.lower().encode())
         else:
             raise Usage(f"bad allowlist line in {path.name}")
-    return hashes, globs
+    return hashes, globs, bound
 
 
 class Patterns:
@@ -96,10 +109,11 @@ class Patterns:
 
 
 class Scanner:
-    def __init__(self, patterns, allow_hashes, allow_globs):
+    def __init__(self, patterns, allow_hashes, allow_globs, allow_bound=()):
         self.p = patterns
         self.allow_hashes = allow_hashes
         self.allow_globs = allow_globs
+        self.allow_bound = list(allow_bound)
         self.findings: dict[tuple[str, str], int] = {}
 
     def add(self, where: str, kind: str):
@@ -116,7 +130,29 @@ class Scanner:
         if any(m in path for m in STORE_PATH_MARKERS):
             self.add(where, "fprint-store-or-secrets-path")
 
-    def check_content(self, where: str, data: bytes, path: str = ""):
+    def hex_allowed(self, h: bytes, path: str) -> bool:
+        h = h.lower()
+        # A bound hash must also be readable in the allowlist file that declares it.
+        in_allowlist = Path(path).name == "secret_scan_allowlist.txt"
+        return h in self.allow_hashes or any(
+            h == bh and (in_allowlist or fnmatch.fnmatch(path, g)) for g, bh in self.allow_bound)
+
+    def check_hex64(self, where: str, data: bytes, path: str, diff: bool):
+        if Path(path).name != PROVENANCE_FILE:
+            chunks = [data]
+        else:
+            # Structural rule: hex is accepted only on the exact provenance lines.
+            chunks = []
+            for raw in data.decode(errors="replace").splitlines():
+                line = raw[1:] if diff and raw[:1] in "+- " else raw
+                if not PROVENANCE_LINE.match(line):
+                    chunks.append(raw.encode())
+        for chunk in chunks:
+            for m in HEX64.finditer(chunk):
+                if not self.hex_allowed(m.group(0), path):
+                    self.add(where, "hex64-not-allowlisted")
+
+    def check_content(self, where: str, data: bytes, path: str = "", diff: bool = False):
         for kind in sorted(self.p.kinds_in(data)):
             self.add(where, f"SECRET-MATCH {kind}")
         if data.startswith(b"FP3") and not self.path_allowed(path):
@@ -125,10 +161,7 @@ class Scanner:
             self.add(where, "private-key-block")
         if EMAIL_RE.search(data):
             self.add(where, "personal-email-in-content")
-        hex_ok_here = bool(path) and self.path_allowed(path)
-        for m in HEX64.finditer(data):
-            if not hex_ok_here and m.group(0).lower() not in self.allow_hashes:
-                self.add(where, "hex64-not-allowlisted")
+        self.check_hex64(where, data, path, diff)
 
     # -- targets -----------------------------------------------------------
     def scan_tree(self, root: Path, files, label: str):
@@ -161,7 +194,7 @@ class Scanner:
             if line.startswith((b"Author:", b"Commit:", b"Date:")):
                 continue
             where = f"history:{commit}:{cur}" if cur else f"history:{commit}"
-            self.check_content(where, line, cur)
+            self.check_content(where, line, cur, diff=True)
         proc.wait()
         # 2) every path ever touched, attributed to a commit
         out = subprocess.run(
@@ -247,7 +280,7 @@ def main(argv=None) -> int:
         return 2 if e.code else 0
     try:
         repo = args.repo.resolve()
-        allow_h, allow_g = load_allowlist(args.allowlist or repo / "scripts" / "secret_scan_allowlist.txt")
+        allow_h, allow_g, allow_b = load_allowlist(args.allowlist or repo / "scripts" / "secret_scan_allowlist.txt")
         pats = Patterns()
         secret_files = [Path(s) for s in args.secret]
         explicit = bool(secret_files)
@@ -288,7 +321,7 @@ def main(argv=None) -> int:
             if not Path(d).is_dir():
                 raise Usage("--path not a directory: " + d)
         pats.compile()
-        sc = Scanner(pats, allow_h, allow_g)
+        sc = Scanner(pats, allow_h, allow_g, allow_b)
         files = git_files(repo)
         sc.scan_tree(repo, files, "tree")
         if not args.no_history:

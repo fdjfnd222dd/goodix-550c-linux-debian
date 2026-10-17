@@ -7,7 +7,8 @@ import asyncio
 from datetime import datetime, timedelta
 from collections.abc import AsyncIterator
 
-from goodix550c_tui.parsers import Event, Status, parse_journal
+from goodix550c_tui.backend import root_commands
+from goodix550c_tui.parsers import THRESHOLD, Event, Status, parse_journal
 
 # (minutes before now, result, score) per line; "open" starts a session (one sudo prompt / test).
 # Scores are typical of this sensor: matches 150-1300 with the odd huge one, misses well below.
@@ -39,7 +40,7 @@ def _stamp(t: datetime) -> str:
 
 def _attempt_line(t: datetime, result: str, score: int) -> str:
     return (f"{_stamp(t)} demo fprintd[812]: goodix550c attempt: action=identify ready_to_down_ms=850 "
-            f"best_score={score} threshold=150 result={result}")
+            f"best_score={score} threshold={THRESHOLD} result={result}")
 
 
 def _open_line(t: datetime, ms: int = 533) -> str:
@@ -79,11 +80,17 @@ class FakeBackend:
         self.fail_delete = False
         self.enroll_script: list[str] | None = None     # override the event kinds of the next enroll
         self.match_score = 318
+        self.journal_sizes: list[int] = []              # the `lines` of every journal() call
+        self.status_calls = 0
+        self.ctl_missing = False                        # pretend goodix550c-ctl is not installed
 
     # ---- reads
     async def status(self) -> Status:
+        self.status_calls += 1
+        if self.ctl_missing:
+            return Status(error="goodix550c-ctl is not installed", ctl_missing=True)
         return Status(sensor_present=True, libfprint_version="1:1.94.10+goodix550c4", patched=True,
-                      held=self.held, apt_pin=True, package_version="1.1.1", dropin_present=True,
+                      held=self.held, package_version="1.1.1",
                       psk_present=None, store_ok=True, pam_enabled=self.pam_enabled,
                       pam_tries=self.tries, pam_timeout=self.timeout, usb_power="on")
 
@@ -94,7 +101,8 @@ class FakeBackend:
     def attempts(self):
         return parse_journal("\n".join(self.lines))[0]
 
-    async def journal(self):
+    async def journal(self, lines: int = 200):
+        self.journal_sizes.append(lines)
         return parse_journal("\n".join(self.lines))
 
     async def num_stages(self) -> int:
@@ -151,13 +159,7 @@ class FakeBackend:
         return True, "deleted"
 
     # ---- root actions
-    def root_commands(self, tries, timeout, pam_enabled):
-        cmds = []
-        if tries is not None and timeout is not None:
-            cmds.append(["sudo", "goodix550c-ctl", "pam", "set", "--tries", str(tries), "--timeout", str(timeout)])
-        if pam_enabled is not None:
-            cmds.append(["sudo", "goodix550c-ctl", "pam", "enable" if pam_enabled else "disable"])
-        return cmds
+    root_commands = staticmethod(root_commands)
 
     def run_privileged(self, cmds: list[list[str]]) -> int:
         self.privileged.append(cmds)

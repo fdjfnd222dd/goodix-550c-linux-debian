@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-from pathlib import Path
+import sys
 
-ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location(
-    "goodix550c_score_report", ROOT / "scripts" / "goodix550c_score_report.py"
-)
-report = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(report)
+from _helpers import ROOT, load_script
+
+report = load_script("goodix550c_score_report.py")
 
 P = "Oct 17 12:00:00 yoga "
 TAG = P + "goodix550c-session[1]: "
@@ -168,3 +164,37 @@ def test_lift_rebase_field_is_summed_per_label_and_old_logs_still_parse():
     # Logs with no field at all report zero.
     old, _ = report.parse_sections(SESSION)
     assert report.build_report(old)["labels"]["genuine"]["lift_rebaselines"] == 0
+
+
+def _tui_parsers():
+    # parsers.py is pure stdlib; the package __init__ does not import textual.
+    tui = str(ROOT / "tui")
+    if tui not in sys.path:
+        sys.path.insert(0, tui)
+    from goodix550c_tui import parsers
+    return parsers
+
+
+def test_field_parser_agrees_with_the_tui_parser():
+    """Two independent parsers read the same driver lines; they must not drift apart."""
+    parsers = _tui_parsers()
+    lines = [
+        attempt("match", 900, lift=2),
+        attempt("retry:too-short", 0, polls=5, ref_retries=1, lift=0),
+        attempt("no-match", 88),
+        open_line("ok", 1200, "done") + " clear_ms=45 up_wait_ms=310",
+        open_line("fail", 5000, "tls"),
+    ]
+    text = "\n".join(lines)
+
+    sections, _ = report.parse_sections(TAG + "label=genuine finger=x run=1\n" + text)
+    sec = sections[0]
+    t_attempts, _t_opens = parsers.parse_journal(text)
+
+    assert [a.fields for a in t_attempts] == sec.attempts
+    assert len(sec.attempts) == 3 and len(sec.opens) == 2
+    assert sec.attempts[0]["lift_rebase"] == 2
+    t_open_fields = [parsers._fields(line.split("goodix550c open:", 1)[1])
+                     for line in lines if "goodix550c open:" in line]
+    assert t_open_fields == sec.opens
+    assert sec.opens[0]["clear_ms"] == 45 and sec.opens[0]["up_wait_ms"] == 310

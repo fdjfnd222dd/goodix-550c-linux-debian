@@ -7,6 +7,7 @@ executed by the app in the real terminal, where the user types their own passwor
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import getpass
 import os
 import shutil
@@ -16,13 +17,33 @@ from collections.abc import AsyncIterator, Callable
 from goodix550c_tui import parsers
 from goodix550c_tui.parsers import Attempt, Event, Status
 
-JOURNAL_CMD = ["journalctl", "-u", "fprintd", "-o", "short-iso", "-n", "200", "--no-pager"]
 CTL = "goodix550c-ctl"
+CTL_ENV = "GOODIX550C_CTL"          # tests / odd installs: full path of the ctl program
+JOURNAL_LINES = 200                 # the Home page wants a decent history; the Test page polls a small tail
 
 
-def ctl_path() -> str:
-    """goodix550c-ctl lives in /usr/sbin, which is not always in a normal user's PATH."""
-    return shutil.which(CTL) or ("/usr/sbin/" + CTL if os.access("/usr/sbin/" + CTL, os.X_OK) else CTL)
+def journal_cmd(lines: int = JOURNAL_LINES) -> list[str]:
+    return ["journalctl", "-u", "fprintd", "-o", "short-iso", "-n", str(lines), "--no-pager"]
+
+
+def resolve_ctl() -> str | None:
+    """Where goodix550c-ctl is: $GOODIX550C_CTL, else /usr/sbin (not always in a user's PATH), else PATH.
+    None when it is not installed."""
+    override = os.environ.get(CTL_ENV)
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    sbin = "/usr/sbin/" + CTL
+    return sbin if os.access(sbin, os.X_OK) else shutil.which(CTL)
+
+
+def root_commands(tries: int | None, timeout: int | None, pam_enabled: bool | None) -> list[list[str]]:
+    """argv lists (with sudo) for the settings the user changed; None = leave alone."""
+    cmds: list[list[str]] = []
+    if tries is not None and timeout is not None:
+        cmds.append(["sudo", CTL, "pam", "set", "--tries", str(tries), "--timeout", str(timeout)])
+    if pam_enabled is not None:
+        cmds.append(["sudo", CTL, "pam", "enable" if pam_enabled else "disable"])
+    return cmds
 
 
 async def run_cmd(argv: list[str], timeout: float = 10.0) -> tuple[int, str]:
@@ -48,10 +69,15 @@ class Backend:
 
     def __init__(self, user: str | None = None):
         self.user = user or os.environ.get("USER") or getpass.getuser()
+        self.ctl = resolve_ctl()        # resolved once
 
     # ---- reads
     async def status(self) -> Status:
-        rc, out = await run_cmd([ctl_path(), "status", "--json"], 15)
+        if self.ctl is None:
+            return Status(error=f"{CTL} is not installed", ctl_missing=True)
+        rc, out = await run_cmd([self.ctl, "status", "--json"], 15)
+        if rc == 127:                                   # vanished since we looked
+            return Status(error=f"{CTL} is not installed", ctl_missing=True)
         if rc != 0 and not out.lstrip().startswith("{"):
             return Status(error=f"{CTL} status failed: {out.strip()[:120] or rc}")
         return parsers.parse_status_json(out)
@@ -60,8 +86,8 @@ class Backend:
         rc, out = await run_cmd(["fprintd-list", self.user], 10)
         return parsers.parse_list(out) if rc == 0 else []
 
-    async def journal(self) -> tuple[list[Attempt], list[parsers.OpenInfo]]:
-        rc, out = await run_cmd(JOURNAL_CMD, 10)
+    async def journal(self, lines: int = JOURNAL_LINES) -> tuple[list[Attempt], list[parsers.OpenInfo]]:
+        rc, out = await run_cmd(journal_cmd(lines), 10)
         return parsers.parse_journal(out) if rc == 0 else ([], [])
 
     async def num_stages(self) -> int:
@@ -99,17 +125,13 @@ class Backend:
             yield Event("ended", "", f"exit {proc.returncode}")
         finally:
             if proc.returncode is None:
-                try:
+                with contextlib.suppress(ProcessLookupError):
                     proc.terminate()
-                except ProcessLookupError:
-                    pass
                 try:
                     await asyncio.wait_for(proc.wait(), 3)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
-                    try:
+                    with contextlib.suppress(ProcessLookupError):
                         proc.kill()
-                    except ProcessLookupError:
-                        pass
 
     def enroll(self, finger: str) -> AsyncIterator[Event]:
         return self._stream(self._lines_cmd(["fprintd-enroll", "-f", finger, self.user]),
@@ -123,15 +145,8 @@ class Backend:
         rc, out = await run_cmd(["fprintd-delete", self.user, "-f", finger], 15)
         return rc == 0, out.strip().splitlines()[-1] if out.strip() else ""
 
-    # ---- root actions
-    def root_commands(self, tries: int | None, timeout: int | None, pam_enabled: bool | None) -> list[list[str]]:
-        """argv lists (with sudo) for the settings the user changed; None = leave alone."""
-        cmds: list[list[str]] = []
-        if tries is not None and timeout is not None:
-            cmds.append(["sudo", CTL, "pam", "set", "--tries", str(tries), "--timeout", str(timeout)])
-        if pam_enabled is not None:
-            cmds.append(["sudo", CTL, "pam", "enable" if pam_enabled else "disable"])
-        return cmds
+    # ---- root actions (argv built by the module-level root_commands, run by the app in the real terminal)
+    root_commands = staticmethod(root_commands)
 
     def run_privileged(self, cmds: list[list[str]]) -> int:
         """Run in the real terminal (the app has suspended itself). Returns the first failure code or 0."""

@@ -61,6 +61,28 @@ for tool in dpkg-deb sha256sum md5sum gzip awk sed; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 
+# finish_deb STAGE DEB: normalise permissions, write md5sums, build the deb, refresh SHA256SUMS
+finish_deb() {
+  local stage="$1" deb="$2" f s
+  local -a execs=()
+  # payload files keep the executable bit only if the source had it (read before flattening modes)
+  while IFS= read -r -d '' f; do execs+=("$f"); done \
+    < <(find "$stage" -type f -not -path "$stage/DEBIAN/*" -perm -u+x -print0)
+  find "$stage" -type d -exec chmod 0755 {} +
+  find "$stage" -type f -not -path "$stage/DEBIAN/*" -exec chmod 0644 {} +
+  if [ "${#execs[@]}" -gt 0 ]; then chmod 0755 "${execs[@]}"; fi
+  ( cd "$stage" && find . -path ./DEBIAN -prune -o -type f -print | LC_ALL=C sort | sed 's|^\./||' | xargs -d '\n' md5sum ) > "$stage/DEBIAN/md5sums"
+  chmod 0644 "$stage/DEBIAN/control" "$stage/DEBIAN/md5sums"
+  [ ! -f "$stage/DEBIAN/conffiles" ] || chmod 0644 "$stage/DEBIAN/conffiles"
+  for s in preinst postinst prerm postrm; do
+    [ ! -f "$stage/DEBIAN/$s" ] || chmod 0755 "$stage/DEBIAN/$s"
+  done
+  dpkg-deb --root-owner-group --build "$stage" "$deb" >/dev/null
+  ( cd "$OUT" && sha256sum -- *.deb > SHA256SUMS )
+  echo "built:   $deb"
+  echo "sha256:  $(sha256sum "$deb" | cut -d' ' -f1)"
+}
+
 build_fingerprint_pkg() {
   local name=goodix550c-fingerprint src="$ROOT/packaging/goodix550c-fingerprint"
   local stage="$WORK/$name" version deb size
@@ -78,18 +100,9 @@ build_fingerprint_pkg() {
   [ -f "$tui_src/app.py" ] || die "missing $tui_src/app.py"
   mkdir -p "$tui_dst"
   ( cd "$tui_src" && find . -name '*.py' -type f -print0 | xargs -0 -I{} cp --parents {} "$tui_dst/" )
-  find "$stage" -type d -exec chmod 0755 {} +
-  find "$stage" -type f -not -path "$stage/DEBIAN/*" -exec chmod 0644 {} +
-  chmod 0755 "$stage/usr/sbin/goodix550c-ctl" "$stage/usr/bin/finger" "$stage/usr/bin/goodix550c-tui"
   size="$(du -sk --exclude=DEBIAN "$stage" | cut -f1)"
   sed -i "s/@INSTALLED_SIZE@/$size/g" "$stage/DEBIAN/control"
-  ( cd "$stage" && find . -path ./DEBIAN -prune -o -type f -print | LC_ALL=C sort | sed 's|^\./||' | xargs -d '\n' md5sum ) > "$stage/DEBIAN/md5sums"
-  chmod 0644 "$stage/DEBIAN/control" "$stage/DEBIAN/md5sums" "$stage/DEBIAN/conffiles"
-  for s in preinst postinst prerm postrm; do chmod 0755 "$stage/DEBIAN/$s"; done
-  dpkg-deb --root-owner-group --build "$stage" "$deb" >/dev/null
-  ( cd "$OUT" && sha256sum -- *.deb > SHA256SUMS )
-  echo "built:   $deb"
-  echo "sha256:  $(sha256sum "$deb" | cut -d' ' -f1)"
+  finish_deb "$stage" "$deb"
 }
 
 case "$PKG_SEL" in
@@ -162,7 +175,6 @@ if [ -f "$HWDB" ]; then
       first = 0
       for (i = 1; i <= n; i++) print line[i]
     }' "$HWDB" > "$HWDB.new"
-  # keep the original blank-line block separators: awk output uses one blank line, as does stock
   mv "$HWDB.new" "$HWDB"
   chmod 0644 "$HWDB"
   if grep -qi '^usb:v27C6p550C' "$HWDB"; then die "550c still listed in staged hwdb"; fi
@@ -194,28 +206,13 @@ build date: $BUILD_DATE
 BUILD
 chmod 0644 "$DOCDIR/GOODIX550C-BUILD"
 
-# normalise permissions
-find "$STAGE" -type d -exec chmod 0755 {} +
-find "$STAGE" -type f -not -path "$STAGE/DEBIAN/*" -exec chmod 0644 {} +
-
 # control
 INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)"
 sed -e "s/@N@/$N/g" -e "s/@SERIES_SHA@/$SERIES_SHA/g" -e "s/@INSTALLED_SIZE@/$INSTALLED_SIZE/g" \
   "$ROOT/packaging/libfprint-2-2/control.in" > "$STAGE/DEBIAN/control"
 chmod 0644 "$STAGE/DEBIAN/control"
 
-# md5sums (regular files only, as dpkg expects)
-( cd "$STAGE" && find . -path ./DEBIAN -prune -o -type f -print | LC_ALL=C sort | sed 's|^\./||' | xargs -d '\n' md5sum ) > "$STAGE/DEBIAN/md5sums"
-chmod 0644 "$STAGE/DEBIAN/md5sums"
-for s in postinst postrm preinst prerm; do
-  [ -f "$STAGE/DEBIAN/$s" ] && chmod 0755 "$STAGE/DEBIAN/$s"
-done
-
-dpkg-deb --root-owner-group --build "$STAGE" "$DEB" >/dev/null
-( cd "$OUT" && sha256sum -- *.deb > SHA256SUMS )
-
-echo "built:   $DEB"
-echo "sha256:  $(sha256sum "$DEB" | cut -d' ' -f1)"
+finish_deb "$STAGE" "$DEB"
 echo "series:  $SERIES_SHA"
 echo "so:      $SO_SHA"
 echo "git:     $GIT_REV (dirty: $GIT_DIRTY)"

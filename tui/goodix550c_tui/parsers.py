@@ -54,44 +54,39 @@ class Event:
     done: bool | None = None        # the "(done)" / "(not done)" flag when fprintd printed one
 
 
-def parse_enroll_line(line: str) -> Event | None:
+# verify results that are only a retry besides the verify-retry-* family
+RETRY_NAMES = {"verify-swipe-too-short", "verify-finger-not-centered", "verify-remove-and-retry"}
+
+
+def _parse_result_line(verb: str, kinds: dict[str, str], retry_prefix: str, started: str, line: str) -> Event | None:
+    """One line of fprintd-enroll / fprintd-verify output -> Event (None = nothing worth showing)."""
     line = line.strip()
     if not line:
         return None
     m = RESULT_RE.search(line)
-    if m and m.group("verb") == "Enroll":
-        kind = ENROLL_KINDS.get(m.group("name"))
-        if kind is None:
-            kind = "retry" if m.group("name").startswith("enroll-retry") else "error"
-        return Event(kind, line, m.group("name"))
-    if line.startswith("Enrolling "):
-        return Event("started", line)
-    if ERROR_RE.search(line):
-        return Event("error", line, line)
-    return None
-
-
-def parse_verify_line(line: str) -> Event | None:
-    line = line.strip()
-    if not line:
-        return None
-    m = RESULT_RE.search(line)
-    if m and m.group("verb") == "Verify":
+    if m and m.group("verb") == verb:
         name = m.group("name")
         done = None if m.group("done") is None else m.group("done") == "done"
-        kind = VERIFY_KINDS.get(name)
+        kind = kinds.get(name)
         if kind is None:
-            kind = "retry" if name.startswith("verify-retry") or name == "verify-swipe-too-short" \
-                or name == "verify-finger-not-centered" or name == "verify-remove-and-retry" else "error"
+            kind = "retry" if name in RETRY_NAMES or name.startswith(retry_prefix) else "error"
         # fprintd says "(not done)" for everything that is only a retry
         if kind == "no-match" and done is False:
             kind = "retry"
         return Event(kind, line, name, done)
-    if line.startswith("Verify started"):
+    if line.startswith(started):
         return Event("started", line)
     if ERROR_RE.search(line):
         return Event("error", line, line)
     return None
+
+
+def parse_enroll_line(line: str) -> Event | None:
+    return _parse_result_line("Enroll", ENROLL_KINDS, "enroll-retry", "Enrolling ", line)
+
+
+def parse_verify_line(line: str) -> Event | None:
+    return _parse_result_line("Verify", VERIFY_KINDS, "verify-retry", "Verify started", line)
 
 
 FINGER_LIST_RE = re.compile(r"^\s*-\s*(?:#\d+:\s*)?(?P<finger>[a-z]+-[a-z-]+)\s*$", re.M)
@@ -145,10 +140,6 @@ class Attempt:
     @property
     def matched(self) -> bool:
         return self.result == "match"
-
-    @property
-    def retry(self) -> bool:
-        return self.result.startswith("retry")
 
     @property
     def scored(self) -> bool:
@@ -264,10 +255,10 @@ class Stats:
     def first_try_pct(self) -> int | None:
         return round(100 * self.first_try / self.sessions) if self.sessions else None
 
-    @property
-    def match_pct(self) -> int | None:
-        n = self.matches + self.nomatches + self.retries
-        return round(100 * self.matches / n) if n else None
+
+def display_threshold(attempts: list[Attempt]) -> int:
+    """The match threshold to show: what the driver logged on its latest attempt."""
+    return attempts[-1].threshold if attempts else THRESHOLD
 
 
 def summarise(attempts: list[Attempt], today: str = "") -> Stats:
@@ -306,17 +297,15 @@ class Status:
     libfprint_version: str = ""
     patched: bool | None = None
     held: bool | None = None
-    apt_pin: bool | None = None
     package_version: str = ""
-    dropin_present: bool | None = None
     psk_present: bool | None = None      # None = cannot tell without root
     store_ok: bool | None = None
     pam_enabled: bool | None = None
     pam_tries: int = 3
     pam_timeout: int = 15
     usb_power: str = ""
-    last_log: str = ""
     error: str = ""                      # set when the status could not be read at all
+    ctl_missing: bool = False            # goodix550c-ctl itself is not installed
 
 
 def parse_status_json(text: str) -> Status:
@@ -337,11 +326,11 @@ def parse_status_json(text: str) -> Status:
 
     return Status(
         sensor_present=b("sensor_present"), libfprint_version=str(d.get("libfprint_version") or ""),
-        patched=b("patched"), held=b("held"), apt_pin=b("apt_pin"),
-        package_version=str(d.get("package_version") or ""), dropin_present=b("dropin_present"),
+        patched=b("patched"), held=b("held"),
+        package_version=str(d.get("package_version") or ""),
         psk_present=b("psk_present"), store_ok=b("store_ok"), pam_enabled=b("pam_enabled"),
         pam_tries=n("pam_tries", 3), pam_timeout=n("pam_timeout", 15),
-        usb_power=str(d.get("usb_power") or ""), last_log=str(d.get("last_log") or ""))
+        usb_power=str(d.get("usb_power") or ""))
 
 
 def validate_settings(tries: int, timeout: int) -> str:

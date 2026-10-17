@@ -420,3 +420,165 @@ def test_small_terminal_still_renders():
             assert "Saving your right middle finger" in t and ("PRESS" in t or "LIFT" in t or "█" in t)
             await pilot.press("escape")
     asyncio.run(go())
+
+
+def test_refresh_skips_hidden_pages_and_redraws_them_when_shown():
+    async def sc(app, pilot, be):
+        await pilot.press("3")
+        await pilot.pause(0.1)
+        home = app.query_one("#page1")
+        calls = []
+        orig = home.refresh_view
+        home.refresh_view = lambda: (calls.append(1), orig())
+        be.held = False
+        await app.refresh_data()
+        assert calls == [] and home.stale                  # hidden: only marked
+        await pilot.press("1")
+        await until(pilot, lambda: "1 thing to fix" in screen_text(app))
+        assert calls and not home.stale                    # redrawn when shown
+    run(sc)
+
+
+def test_refresh_does_nothing_when_data_is_unchanged():
+    async def sc(app, pilot, be):
+        await pilot.pause(0.1)
+        calls = []
+        app.refresh_pages = lambda: calls.append(1)
+        await app.refresh_data()
+        await app.refresh_data(with_status=False)
+        assert calls == []
+        be.tries = 4
+        await app.refresh_data()
+        assert calls == [1]
+    run(sc)
+
+
+def test_background_tick_reads_status_only_every_30_seconds():
+    async def sc(app, pilot, be):
+        before = be.status_calls
+        app._status_at = time.monotonic()                  # status was just read
+        app._tick()
+        await pilot.pause(0.1)
+        assert be.status_calls == before and be.journal_sizes
+        app._status_at = time.monotonic() - 31
+        app._tick()
+        await until(pilot, lambda: be.status_calls == before + 1)
+    run(sc)
+
+
+def test_tick_is_skipped_for_help_and_dialogs():
+    async def sc(app, pilot, be):
+        await pilot.press("5")
+        await pilot.pause(0.1)
+        n = len(be.journal_sizes)
+        app._tick()
+        await pilot.pause(0.1)
+        assert len(be.journal_sizes) == n                  # Help is showing
+        await pilot.press("1", "d")                        # dialog open
+        n = len(be.journal_sizes)
+        app._tick()
+        await pilot.pause(0.1)
+        assert len(be.journal_sizes) == n
+    run(sc)
+
+
+def test_settings_edits_survive_a_background_refresh():
+    async def sc(app, pilot, be):
+        await pilot.press("4", "right")                    # tries 3 -> 4, not applied
+        st = app.query_one("#page4")
+        assert st.tries == 4 and st.edited
+        be.timeout = 20                                    # the system changes underneath
+        await app.refresh_data()
+        assert app.status.pam_timeout == 20
+        assert st.tries == 4 and st.timeout == 15          # edits kept, nothing clobbered
+        await pilot.press("r")                             # reload: now the system values win
+        await until(pilot, lambda: st.timeout == 20)
+        assert st.tries == 3 and not st.edited
+        be.tries = 2                                       # untouched controls follow the system
+        await app.refresh_data()
+        assert st.tries == 2
+    run(sc)
+
+
+def test_threshold_comes_from_the_latest_attempt():
+    async def sc(app, pilot, be):
+        assert "│ = 150" in screen_text(app) and "needs 150" in screen_text(app)
+        be.lines.append(be.lines[-1].replace("threshold=150", "threshold=200"))
+        await app.refresh_data()
+        await pilot.pause(0.05)
+        t = screen_text(app)
+        assert "│ = 200" in t and "needs 200" in t and "│ = 150" not in t
+        await pilot.press("5")
+        assert "score of 200 or more" in screen_text(app)
+    run(sc)
+
+
+def test_home_says_when_ctl_is_not_installed():
+    async def sc(app, pilot, be):
+        be.ctl_missing = True
+        await app.refresh_data()
+        await pilot.pause(0.05)
+        t = screen_text(app)
+        assert "goodix550c-ctl not installed" in t and "apt install goodix550c-fingerprint" in t
+    run(sc)
+
+
+def test_enroll_end_states_table():
+    from goodix550c_tui.pages import END_STATES
+    assert {k: w for k, (w, _) in END_STATES.items()} == {
+        "failed": "FAILED", "disconnected": "NO SENSOR", "full": "FULL", "duplicate": "ALREADY SAVED"}
+    assert all(h.endswith(".") or h.endswith(")") for _, h in END_STATES.values())
+
+
+def test_enroll_uses_the_cached_stage_count_and_pauses_before_press():
+    from goodix550c_tui.pages import LIFT_TO_PRESS, REMOVE_TO_PRESS, RETRY_TO_PRESS
+
+    async def sc(app, pilot, be):
+        await until(pilot, lambda: app.stages_hint == 4)
+        calls = []
+        orig = be.num_stages
+
+        async def counting():
+            calls.append(1)
+            return await orig()
+        be.num_stages = counting
+        be.enroll_script = ["stage", "wait"]
+        await pilot.press("2", "right", "enter")
+        enroll = app.query_one("#page2")
+        await until(pilot, lambda: enroll.stage == 1)
+        assert calls == [] and enroll.stages == 4          # not asked again
+        await pilot.press("escape")
+    run(sc, step=0.05, stages=4)
+    assert min(LIFT_TO_PRESS, RETRY_TO_PRESS, REMOVE_TO_PRESS) >= 1.5   # driver's finger-up wait
+
+
+def test_test_page_polls_a_small_journal_window():
+    async def sc(app, pilot, be):
+        await pilot.press("3", "enter")
+        await until(pilot, lambda: app.query_one("#page3").mode == "end")
+        small = [n for n in be.journal_sizes if n != 200]
+        assert small and max(small) <= 20
+    run(sc, step=0.02)
+
+
+def test_fingerprint_view_caches_text_and_redraws_blink_only_on_phase_change():
+    async def sc(app, pilot, be):
+        await pilot.press("3")
+        fv = view(app, "#tst-view")
+        fv.set("lift", "LIFT", "Lift your finger.")
+        assert fv._column(60, 30) is fv._column(60, 30)            # static text built once
+        first = fv._column(60, 30)
+        fv.set("lift", "LIFT", "Lift your finger now.")
+        assert fv._column(60, 30) is not first                      # a changed key rebuilds it
+        draws = []
+        orig = fv.redraw
+        fv.redraw = lambda: (draws.append(1), orig())
+        fv._state_t = time.monotonic()
+        orig()
+        for _ in range(5):
+            fv._frame()
+        assert draws == []                                          # same 0.4 s phase: no redraw
+        fv._state_t -= 0.45
+        fv._frame()
+        assert draws == [1]
+    run(sc)

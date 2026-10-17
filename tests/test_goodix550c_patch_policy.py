@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import importlib.util
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+from _helpers import ROOT, load_script
 
-ROOT = Path(__file__).resolve().parents[1]
 PATCH_DIR = ROOT / "patches" / "goodix-550c"
 DRIVER_PATCH = PATCH_DIR / "0001-goodix53x5-add-fail-closed-550c-policy.patch"
 INTEGRATION_PATCH = PATCH_DIR / "0002-libfprint-v1.94.10-integration.patch"
@@ -39,16 +39,8 @@ NATIVE_FDT_SHIM = ROOT / "tests" / "native" / "goodix550c_fdt_down_test_shim.h"
 NATIVE_MANUAL_FDT_TEST = ROOT / "tests" / "native" / "test_goodix550c_manual_fdt.c"
 VERIFY_SCRIPT = ROOT / "scripts" / "verify_goodix550c_patch.py"
 
-
-def _load_verifier():
-    """Import the shipped audit so its option rule is what the tests exercise."""
-    spec = importlib.util.spec_from_file_location("goodix550c_patch_verifier", VERIFY_SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-VERIFIER = _load_verifier()
+# The shipped audit, so its option rule is what the tests exercise.
+VERIFIER = load_script("verify_goodix550c_patch.py", "goodix550c_patch_verifier")
 
 
 def test_default_off_option_rule_rejects_an_option_that_defaults_on():
@@ -986,3 +978,40 @@ def test_touch_direction_summary_field_is_integer_only():
     # Reset per attempt next to the other summary fields, and no key/frame text.
     assert "self->summary_lift_rebases = 0;" in added
     assert not re.search(r"\bpsk\b|\botp\b", added, re.I)
+
+
+# --- cross-component constants must not drift --------------------------------
+
+def _tui_parsers():
+    tui = str(ROOT / "tui")
+    if tui not in sys.path:
+        sys.path.insert(0, tui)
+    from goodix550c_tui import parsers
+    return parsers
+
+
+def test_tui_finger_names_match_the_ctl_valid_fingers():
+    ctl = ROOT / "packaging" / "goodix550c-fingerprint" / "usr" / "sbin" / "goodix550c-ctl"
+    match = re.search(r'^VALID_FINGERS="([^"]+)"', ctl.read_text(encoding="utf-8"), re.M)
+    assert match is not None
+    ctl_fingers = match.group(1).split()
+
+    fingers = _tui_parsers().FINGERS
+    assert len(fingers) == 10
+    assert sorted(fingers) == sorted(ctl_fingers)
+
+
+def test_tui_threshold_matches_the_driver_sigfm_best_min():
+    """The matcher threshold lives in upstream private.h; no patch may move it silently."""
+    for patch in sorted(PATCH_DIR.glob("*.patch")):
+        for line in patch.read_text(encoding="utf-8").splitlines():
+            assert not (line[:1] in "+-" and "define GOODIX_SIGFM_BEST_MIN" in line), patch.name
+
+    private_h = (ROOT / "research" / "upstream" / "goodix-550c-driver" / "drivers"
+                 / "goodix53x5" / "goodix53x5-private.h")
+    if not private_h.is_file():
+        pytest.skip("run scripts/fetch_upstream_sources.sh to fetch the driver sources")
+    match = re.search(r"^#define\s+GOODIX_SIGFM_BEST_MIN\s+(\d+)\b",
+                      private_h.read_text(encoding="utf-8"), re.M)
+    assert match is not None
+    assert int(match.group(1)) == _tui_parsers().THRESHOLD == 150

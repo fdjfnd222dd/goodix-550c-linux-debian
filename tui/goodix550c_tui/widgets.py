@@ -1,7 +1,9 @@
-"""Widgets: the panel base, the live fingerprint view, the hands picker and the modal dialogs."""
+"""Widgets: the panel base, the live fingerprint view and the modal dialogs."""
 from __future__ import annotations
 
+import math
 import time
+from typing import NamedTuple
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -65,6 +67,15 @@ class Panel(Static):
 GROW_SECONDS = 0.8          # one passed scan grows the print over this long
 SWEEP_SECONDS = 0.7         # Test page: the result colour sweeps over the whole print
 FRAME = 1 / 24
+FLASH_SECONDS = 0.4         # lift / retry / nomatch blink: on for this long, off for this long
+PULSE_SECONDS = 1.6         # press: one breath
+PULSE_STEPS = 32            # the breath is quantised to this many levels; redraw only when one changes
+
+
+class _Column(NamedTuple):
+    """The parts of the text column that only change with the key in FingerprintView._column."""
+    word_rows: tuple[str, ...]          # block letters (or one plain line); coloured per frame
+    wrapped: tuple[Text, ...]           # hint, sub and next_hint, wrapped and styled
 
 
 class FingerprintView(Static):
@@ -96,6 +107,9 @@ class FingerprintView(Static):
         self._anim_len = GROW_SECONDS
         self._state_t = time.monotonic()
         self.animate = True
+        self._column_key: tuple | None = None
+        self._column_val = _Column((), ())
+        self._drawn_phase: float | int | None = None    # flash / pulse phase of the last redraw
 
     # ---- driving it
     def on_mount(self) -> None:
@@ -148,25 +162,37 @@ class FingerprintView(Static):
                 e = 1 - (1 - t) ** 3                    # ease out
                 self.shown = self._anim_from + (self.fill - self._anim_from) * e
             self.redraw()
-        elif self.state in art.FLASHING or self.state in art.PULSING:
+        elif self._phase() != self._drawn_phase:        # blinking / breathing: only when it visibly changes
             self.redraw()
 
     def on_resize(self, event) -> None:
         self.redraw()
 
     # ---- colours
+    def _age(self) -> float:
+        return time.monotonic() - self._state_t
+
+    def _phase(self) -> int | None:
+        """Which step of the blink / breath we are in (None = steady); a redraw is due when it changes."""
+        if self.state in art.FLASHING:
+            return int(self._age() / FLASH_SECONDS)
+        if self.state in art.PULSING:
+            return round(self._pulse() * PULSE_STEPS)
+        return None
+
+    def _pulse(self) -> float:
+        return 0.78 + 0.22 * (0.5 + 0.5 * math.cos(self._age() * 2 * math.pi / PULSE_SECONDS))
+
     def colours(self) -> tuple[str, str, str]:
         """(lit, unlit, word) colours for the current state and moment."""
         base = art.STATE_COLOUR.get(self.state, FG)
-        age = time.monotonic() - self._state_t
         if self.state == "idle":
             return art.blend(FG, BG, 0.35), art.blend(FG, BG, 0.80), art.blend(FG, BG, 0.2)
         k = 1.0
-        if self.state in art.PULSING:                   # gentle breathing, ~1.6 s
-            import math
-            k = 0.78 + 0.22 * (0.5 + 0.5 * math.cos(age * 2 * math.pi / 1.6))
-        elif self.state in art.FLASHING:                # on/off flash, 0.4 s each
-            k = 1.0 if int(age / 0.4) % 2 == 0 else 0.45
+        if self.state in art.PULSING:                   # gentle breathing
+            k = round(self._pulse() * PULSE_STEPS) / PULSE_STEPS
+        elif self.state in art.FLASHING:                # on/off flash
+            k = 1.0 if int(self._age() / FLASH_SECONDS) % 2 == 0 else 0.45
         lit = art.blend(BG, base, k)
         unlit = art.blend(art.blend(FG, base, 0.25), BG, 0.74 if k >= 0.9 else 0.80)
         return lit, unlit, art.blend(BG, base, max(k, 0.55))
@@ -186,7 +212,37 @@ class FingerprintView(Static):
             t.append("▱" * (n - on), TRACK)
         return t
 
+    def _head_lines(self) -> int:
+        """Rows used above the big word: title, progress, one blank."""
+        n = 1 if self.title else 0
+        if self.stages and self.show_bar:
+            n += 2
+        elif self.show_bar and self.state != "idle":
+            n += 1
+        return n + 1
+
+    def _column(self, width: int, height: int) -> _Column:
+        """Block letters and wrapped hint lines: expensive, and the same every frame of a state."""
+        key = (self.state, self.word, self.hint, self.sub, self.next_hint, self.title, self.stage,
+               self.stages, self.show_bar, width, height)
+        if key != self._column_key:
+            used = self._head_lines()
+            if art.big_word_width(self.word) <= width and height >= used + 5 + 4:
+                rows = [t.plain for t in art.big_word(self.word, "")]
+            elif art.big_word_width(self.word, half=True) <= width and height >= used + 3 + 3:
+                rows = [t.plain for t in art.big_word(self.word, "", half=True)]
+            else:
+                rows = [self.word]
+            wrapped = art.wrap(self.hint, width, f"bold {WHITE}" if self.state != "idle" else FG)
+            if self.sub:
+                wrapped += art.wrap(self.sub, width, FG)
+            if self.next_hint:
+                wrapped += art.wrap(self.next_hint, width, DIM)
+            self._column_key, self._column_val = key, _Column(tuple(rows), tuple(wrapped))
+        return self._column_val
+
     def text_column(self, width: int, height: int, word_colour: str, colour: str) -> list[Text]:
+        col = self._column(width, height)
         out: list[Text] = []
         if self.title:
             out.append(Text(self.title, style=f"bold {FG}", no_wrap=True))
@@ -199,18 +255,9 @@ class FingerprintView(Static):
         elif self.show_bar and self.state != "idle":
             out.append(Text(f"{round(self.shown * 100)}%", style=DIM))
         out.append(Text())
-        if art.big_word_width(self.word) <= width and height >= len(out) + 5 + 4:
-            out += art.big_word(self.word, word_colour)
-        elif art.big_word_width(self.word, half=True) <= width and height >= len(out) + 3 + 3:
-            out += art.big_word(self.word, word_colour, half=True)
-        else:
-            out.append(Text(self.word, style=f"bold {word_colour}"))
+        out += [Text(r, style=f"bold {word_colour}", no_wrap=True) for r in col.word_rows]
         out.append(Text())
-        out += art.wrap(self.hint, width, f"bold {WHITE}" if self.state != "idle" else FG)
-        if self.sub:
-            out += art.wrap(self.sub, width, FG)
-        if self.next_hint:
-            out += art.wrap(self.next_hint, width, DIM)
+        out += col.wrapped
         if self.extra and len(out) + 2 <= height:
             out.append(Text())
             out += self.extra[: max(0, height - len(out))]
@@ -244,30 +291,9 @@ class FingerprintView(Static):
     def redraw(self) -> None:
         if not self.is_attached:
             return
+        self._drawn_phase = self._phase()
         w, h = self.content_size.width or 100, self.content_size.height or 30
         self.update(Text("\n", no_wrap=True).join(self.lines(w, h)[:h]))
-
-
-class HandsPicker(Static):
-    """Both hands, arrow-key selectable (selection lives in `app.sel`)."""
-
-    DEFAULT_CSS = "HandsPicker { width: 100%; height: auto; }"
-
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.enrolled: set[str] = set()
-        self.selected: str | None = None
-
-    def set(self, enrolled, selected) -> None:
-        self.enrolled, self.selected = set(enrolled), selected
-        self.redraw()
-
-    def redraw(self) -> None:
-        w = self.content_size.width or art.HANDS_W
-        self.update(Text("\n").join(art.centre(ln, w) for ln in art.hands_lines(self.enrolled, self.selected)))
-
-    def on_resize(self, event) -> None:
-        self.redraw()
 
 
 def selection_line(finger: str, enrolled: set[str]) -> Text:
