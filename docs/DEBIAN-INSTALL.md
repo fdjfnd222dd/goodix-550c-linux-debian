@@ -87,7 +87,7 @@ directory (and the detached signature file if one is published), then:
 1. Verify: `sha256sum -c SHA256SUMS --ignore-missing`
 2. Install both packages in one transaction (the config package depends on the
    library's `libfprint-goodix550c` virtual package):
-   `sudo apt install ./libfprint-2-2_1.94.10+goodix550cN_amd64.deb ./goodix550c-fingerprint_1.0.0_all.deb`
+   `sudo apt install ./libfprint-2-2_1.94.10+goodix550cN_amd64.deb ./goodix550c-fingerprint_1.1.N_all.deb`
    Use the actual file names. apt may ask to replace Debian's `libfprint-2-2`; that
    is expected. Keep these files somewhere that is not inside a Timeshift snapshot
    (for example `~/goodix550c-debs/patched/`), because they are what you reinstall
