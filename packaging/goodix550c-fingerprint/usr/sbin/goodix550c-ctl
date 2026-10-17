@@ -80,10 +80,10 @@ usb_power_state() {
   # prints "<devpath>=<control>" per matching device
   local d v p c
   for d in "$R"/sys/bus/usb/devices/*; do
-    [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ] || continue
+    if [ ! -r "$d/idVendor" ] || [ ! -r "$d/idProduct" ]; then continue; fi
     read -r v < "$d/idVendor" || true
     read -r p < "$d/idProduct" || true
-    [ "$v" = "$VENDOR" ] && [ "$p" = "$PRODUCT" ] || continue
+    if [ "$v" != "$VENDOR" ] || [ "$p" != "$PRODUCT" ]; then continue; fi
     c='?'
     if [ -r "$d/power/control" ]; then read -r c < "$d/power/control" || c='?'; fi
     echo "${d##*/}=$c"
@@ -222,7 +222,7 @@ cmd_status() {
   echo "recent driver log:"
   local lg
   lg="$(driver_log 10)"
-  if [ -n "$lg" ]; then echo "$lg" | sed 's/^/  /'; else echo "  (none readable)"; fi
+  if [ -n "$lg" ]; then printf '  %s\n' "${lg//$'\n'/$'\n'  }"; else echo "  (none readable)"; fi
   echo "recovery one-liner:"
   echo "  $(recovery_line)"
 }
@@ -260,7 +260,7 @@ cmd_install_psk() {
   need_root install-psk
   [ $# -eq 1 ] || die "usage: goodix550c-ctl install-psk <file>"
   local src="$1" size
-  [ -f "$src" ] && [ -r "$src" ] || die "not a readable file: $src"
+  if [ ! -f "$src" ] || [ ! -r "$src" ]; then die "not a readable file: $src"; fi
   size="$(stat -c %s "$src")"
   TMP_PSK="$(mktemp)"
   trap 'rm -f "$TMP_PSK"' EXIT
@@ -406,8 +406,10 @@ cmd_pam() {
 
 cmd_rollback() {
   need_root rollback-stock
-  local deb
-  deb="$(ls "$DEBS"/stock/libfprint-2-2_*.deb 2>/dev/null | head -n 1 || true)"
+  local deb="" cand
+  for cand in "$DEBS"/stock/libfprint-2-2_*.deb; do
+    if [ -f "$cand" ]; then deb="$cand"; break; fi
+  done
   [ -n "$deb" ] || die "no stock deb in $DEBS/stock"
   pam-auth-update --disable "$PROFILE" || true
   apt-mark unhold "$LIBPKG" || true
