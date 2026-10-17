@@ -2,17 +2,20 @@
 
 Goal: maximise **genuine first-try match** and **sudo/lock-screen first-try success**, minimise time-to-result, with **0 impostor accepts** and **0 open failures**, without touching the safety invariants in `CLAUDE.md`.
 
-## Where we are (2026-10-17, `+goodix550c5`, fresh enrollment, 16 samples)
-| Metric | Value | Target |
-|---|---|---|
-| Genuine first try (B1) | 85% | ≥ 95% |
-| sudo first try (B5, 3 tries) | 80% | ≥ 95% |
-| Finger already down, ≤ 2 tries (B2) | 75–88% | ≥ 95% |
-| Lock screen after suspend (B6) | 2/3 first try, 3/3 ≤ 2 | 10/10 first try |
-| Impostor accepts | 0 (max score 3 vs 150) | 0 |
-| Open failures | 0 / 100+ | 0 |
-| Median score (genuine) | ~4,500 | — |
-Remaining genuine misses: good reference (~2260), 140–200 keypoints, but best_score 0–40 → **partial overlap / placement** between probe and templates, not capture faults.
+## Where we are (2026-10-17, `+goodix550c7` + `goodix550c-fingerprint 1.1.4`, natural+fingertip enrollment, 24 samples)
+| Metric | c5 | Now | Target |
+|---|---|---|---|
+| Genuine first try | 85% (20) | 100% (12, c7-enroll) | ≥ 95% |
+| Finger-down → result | ~410 ms | 258 ms (p90 261) | lower |
+| Impostor accepts | 0 (max 3) | 0 (max 2; max 16 across all rounds) | 0 |
+| Open failures | 0 | 0 | 0 |
+Shipped settings (package drop-in): `SETTLE_MS=150 POLL_DELAY_MS=60 ENROLL_SAMPLES=24`. Enroll with `scripts/goodix550c_enroll_coached.sh` (natural touches with small shifts, some fingertip and light taps). Next confirmation: a full `test` block (B1 20 / B2 / B3 / B5) on the new enrollment, plus lock screen after suspend (B6).
+
+### Lessons
+- Misses were coverage, not capture timing: nearly every miss had full contact (noncontact 0) and a score ≤ 60.
+- Wide coaching (rolls, exaggerated tips) stored samples everyday touches never hit (r2: 11/12 matches on a single sample). Coach around the natural touch instead.
+- fprintd refuses a second slot for an already-enrolled finger (`enroll-duplicate`), so "two templates per finger" is not available through fprintd.
+- Enrollment finger-up wait used to hang silently for ~60 s if the user re-pressed; 0021 prompts "lift" after 1.5 s and bounds the wait at 20 s.
 
 ## Organisation
 - **Opus planner** (main session): picks the next hypothesis from the backlog, writes a 1-page experiment card (hypothesis, variable, values, expected effect on which metric, risk), reviews results, decides keep/revert, updates this file.
@@ -79,3 +82,4 @@ UX: on retry say "shift your finger slightly" (retries currently miss 43%).
 | r2 | ENROLL_SAMPLES + wide coaching | 16→24, rolls/tips | 92% (12; miss 87) | — | — | 0 (max 9) | revert coaching: 11/12 matches hit one sample (#18 "roll RIGHT"); median score 765 vs 6598. Natural touch ≠ coached centre. Next: 24 natural |
 | r4 confirm | r1 settings, original prints restored | 150/60 | 75% (20): 5 misses all in first 8 (fingertip touches, scores 0–127); last 12/12, median score ~20k | — | — | 0 (max 16, n=8) | keep r1 → baked into goodix550c-fingerprint 1.1.3 drop-in |
 | final c7 | 0021 + 1.1.3 installed | 150/60 | 75% (12): misses 26, 56 (coverage), 0 w/ noncontact 108 (light/partial tap) | — | — | 0 (max 4) | pooled r1-settings 35/44 = 80%; 8/9 misses nc=0 → coverage, not speed. Next lever: one natural+tip enrollment (24) |
+| c7-enroll | ENROLL_SAMPLES 24 + natural/fingertip coaching (+0021) | 24 | **100% (12)**, score min 289, median 5895 | — | — | 0 (max 2) | kept → goodix550c-fingerprint 1.1.4 ships ENROLL_SAMPLES=24 |

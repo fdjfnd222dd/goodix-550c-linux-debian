@@ -25,12 +25,14 @@ Rollback: install the previous `+goodix550cN`, or `sudo goodix550c-ctl rollback-
 
 ## Measure
 - Driver writes one `goodix550c open:` and one `goodix550c attempt:` journal line per open/attempt (`GOODIX550C_LOG_SUMMARY=1`, set by the package drop-in). Fields: ref_mean, ref_retries, noncontact_x1000, keypoints, best_score, result, dmax_pos/dmax_neg, clear_*, up_wait_ms, lift_rebase, drain_bytes, tls_retry.
-- `scripts/goodix550c_session.sh b1|b2|b3|b4|b5|b6|test|final|rest|report <name>` — guided blocks (genuine ×20, finger-already-down ×8, impostor ×8, hands-off opens ×30, sudo ×10, suspend ×3). JSON lands in `~/goodix550c-debs/measurements/`.
+- `scripts/goodix550c_session.sh b1|b2|b3|b4|b5|b6|test|final|rest|quick|qsudo|report <name>` — guided blocks (genuine ×20, finger-already-down ×8, impostor ×8, hands-off opens ×30, sudo ×10, suspend ×3; `quick` = genuine ×12 + impostor ×4 in ~90 s, `qsudo` = sudo ×6). JSON lands in `~/goodix550c-debs/measurements/`; the report ends with a `--compare` table against `BASELINE=<json>`.
+- Runtime tunables (patch 0020): `GOODIX550C_TUNE_<NAME>=<int>` in a `60-*.conf` fprintd drop-in + `systemctl restart fprintd`; effective values logged as `goodix550c tune:` at open. Attempt lines also carry `down_to_result_ms`, `capture_ms`, `match_ms`, `templates_scored`, `best_idx`, `second_best`.
+- `scripts/goodix550c_enroll_coached.sh` (`REPLACE=1` to replace a slot) — one placement prompt per stage. Back up `/var/lib/fprint` first.
 - `scripts/goodix550c_score_report.py --log <journal export> [--json]` — per-label rates, retry reasons, score stats.
 - The user is in `systemd-journal`, so `journalctl -u fprintd` is readable without sudo.
 
 ## Layout
-- `patches/goodix-550c/` driver series (0015 logging, 0016 stale-TLS fix, 0017/0018 finger-present + non-contact guards, 0019 touch-direction finger-down)
+- `patches/goodix-550c/` driver series (0015 logging, 0016 stale-TLS fix, 0017/0018 finger-present + non-contact guards, 0019 touch-direction finger-down, 0020 runtime tunables + timing fields, 0021 enroll lift prompt + 20 s finger-up bound)
 - `packaging/libfprint-2-2/`, `packaging/goodix550c-fingerprint/` (drop-in, udev rule, TLP + apt-pin conffiles, PAM profile, `goodix550c-ctl`, `finger` wrappers)
 - `tui/goodix550c_tui/` the `finger` Textual TUI (must run on Debian's python3-textual 2.1)
 - `scripts/` build, session, report, secret scan; `tests/` pytest + `tests/native/` C tests
