@@ -211,7 +211,9 @@ cmd_pam() {
         # pam-auth-update would carry a hand-edited max-tries into the generated line
         mkdir -p "$R/var/backups/goodix550c"
         cp -a "$COMMON_AUTH" "$R/var/backups/goodix550c/common-auth.$(date +%Y%m%d%H%M%S)"
-        sed -i '/pam_fprintd\.so/ s/max-tries=[0-9]*/max-tries=1/' "$COMMON_AUTH"
+        want="$(grep -o 'max-tries=[0-9]*' "$PAM_PROFILE" 2>/dev/null | head -1 || true)"
+        want="${want:-max-tries=3}"
+        sed -i "/pam_fprintd\.so/ s/max-tries=[0-9]*/$want/" "$COMMON_AUTH"
       fi
       # --force: the sandboxed run (WP2) showed the generated stack is correct once max-tries is normalized
       pam-auth-update --force --disable fprintd --enable "$PROFILE" ;;

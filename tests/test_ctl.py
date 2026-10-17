@@ -26,7 +26,7 @@ def deb(tmp_path_factory):
     out = tmp_path_factory.mktemp("out")
     r = run([BUILD, "--pkg", "goodix550c-fingerprint", "--out", out, "--work", out / "w"])
     assert r.returncode == 0, r.stderr
-    d = out / "goodix550c-fingerprint_1.0.1_all.deb"
+    d = out / "goodix550c-fingerprint_1.0.2_all.deb"
     assert d.exists()
     return d
 
@@ -38,7 +38,7 @@ def field(deb, name):
 def test_control(deb):
     assert field(deb, "Package") == "goodix550c-fingerprint"
     assert field(deb, "Architecture") == "all"
-    assert field(deb, "Version") == "1.0.1"
+    assert field(deb, "Version") == "1.0.2"
     assert field(deb, "Depends") == "libfprint-goodix550c (>= 3), fprintd, libpam-fprintd, udev"
     assert field(deb, "Recommends") == "tlp"
     assert "@" not in field(deb, "Installed-Size")
@@ -105,7 +105,7 @@ def test_refuse_overwrite(tmp_path):
     assert run(args).returncode == 0
     r = run(args)
     assert r.returncode != 0 and "refusing to overwrite" in r.stderr
-    assert "goodix550c-fingerprint_1.0.1_all.deb" in (tmp_path / "SHA256SUMS").read_text()
+    assert "goodix550c-fingerprint_1.0.2_all.deb" in (tmp_path / "SHA256SUMS").read_text()
 
 
 @pytest.mark.parametrize("name", SCRIPTS)
@@ -248,7 +248,9 @@ def test_pam_enable_normalizes_max_tries(tmp_path):
     pau.chmod(0o755)
     env["PATH"] = f"{shimdir}:{env['PATH']}"
     root = Path(env["GOODIX550C_ROOT"])
+    ca = root / "etc/pam.d/common-auth"
+    ca.write_text(ca.read_text().replace("max-tries=3", "max-tries=7"))
     r = run([CTL, "pam", "enable"], env=env)
     assert r.returncode == 0, r.stderr
-    assert "max-tries=1" in (root / "etc/pam.d/common-auth").read_text()
+    assert "max-tries=3" in (root / "etc/pam.d/common-auth").read_text()
     assert "--enable goodix550c-fingerprint" in (root / "pau.args").read_text()
