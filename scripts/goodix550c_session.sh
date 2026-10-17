@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Guided fingerprint measurement blocks (user level; no sudo except B5's own prompt).
 #
-#   goodix550c_session.sh b1|b2|b3|b4|b5|b6|all|rest|final|baseline|test|report [name]
+#   goodix550c_session.sh b1|b2|b3|b4|b5|b6|all|rest|final|baseline|test|quick|qsudo|report [name]
 #
 # Every run is bracketed by journal markers (logger -t goodix550c-session) that
 # scripts/goodix550c_score_report.py uses to split the fprintd journal by label.
@@ -24,12 +24,18 @@ B4_COUNT=30   # hands-off opens
 B5_COUNT=10   # sudo
 B6_COUNT=3    # suspend
 
+# quick / qsudo experiment blocks (override from the environment).
+QUICK_GENUINE="${QUICK_GENUINE:-12}"
+QUICK_IMPOSTOR="${QUICK_IMPOSTOR:-4}"
+QUICK_SUDO="${QUICK_SUDO:-6}"
+
 # Timing (seconds); override from the environment.
 LEAD_IN_SECS="${LEAD_IN_SECS:-3}"       # pause after a block's instructions
 B2_INTRO_SECS="${B2_INTRO_SECS:-4}"     # b2 reads a longer 3-step explanation
 HOLD_SECS="${HOLD_SECS:-3}"             # b2: finger held on the pad before/after the run starts
 LIFT_GAP_SECS="${LIFT_GAP_SECS:-2}"     # b2: time between the LIFT and TAP prompts
-PAUSE_SECS="${PAUSE_SECS:-2}"           # between runs
+PAUSE_SECS_SET="${PAUSE_SECS+x}"         # non-empty if the caller chose a pause (quick then keeps it)
+PAUSE_SECS="${PAUSE_SECS:-2}"           # between runs (quick/qsudo default to 1)
 RELEASE_SECS="${RELEASE_SECS:-2}"       # b4: let fprintd release the device between claims
 RUN_COUNTER=0
 TAG=goodix550c-session
@@ -45,7 +51,8 @@ next_run() {
     RUN_ID="$(date +%H%M%S)-$1-$RUN_COUNTER"
 }
 
-marker_start() { logger -t "$TAG" "label=$1 finger=$2 run=$RUN_ID"; }
+now_ms() { echo $((${EPOCHREALTIME/./} / 1000)); }   # epoch ms, no fork (bash 5)
+marker_start() { logger -t "$TAG" "label=$1 finger=$2 run=$RUN_ID t_ms=$(now_ms)"; }
 marker_end() { logger -t "$TAG" "end run=$RUN_ID${1:+ result=$1}"; }
 
 BOLD="$(tput bold 2>/dev/null || true)"; NORM="$(tput sgr0 2>/dev/null || true)"
@@ -54,14 +61,21 @@ say() { printf '%s%s%s\n' "$BOLD" "$1" "$NORM"; }
 # Streams fprintd-verify so the human sees TOUCH NOW the moment the sensor is ready.
 # Sets RESULT to match|no-match|timeout|other.
 verify_once() {
-    local line
+    local line tok
     RESULT=other
     while IFS= read -r line; do
         case "$line" in
-            *"Verify started"*) [[ -n "${QUIET_START:-}" ]] || say "   >>> TOUCH THE SENSOR NOW (rest flat ~1 sec, then lift) <<<" ;;
-            *"Verify result:"*"(not done)"*) say "   ...didn't read it. Lift, then TOUCH AGAIN." ;;
-            *"verify-match"*) RESULT=match ;;
-            *"verify-no-match"*) RESULT=no-match ;;
+            *"Verify started"*)
+                logger -t "$TAG" "phase=ready run=$RUN_ID t_ms=$(now_ms)"
+                [[ -n "${QUIET_START:-}" ]] || say "   >>> TOUCH NOW <<<" ;;
+            *"Verify result:"*)
+                tok="${line#*Verify result: }"; tok="${tok%% *}"
+                logger -t "$TAG" "phase=result run=$RUN_ID result=${tok#verify-} t_ms=$(now_ms)"
+                case "$line" in
+                    *"(not done)"*) say "   Lift. TOUCH NOW again." ;;
+                    *"verify-match"*) RESULT=match ;;
+                    *"verify-no-match"*) RESULT=no-match ;;
+                esac ;;
         esac
     done < <(timeout "$VERIFY_TIMEOUT" stdbuf -oL -eL fprintd-verify -f any "$USER" 2>&1; echo "rc=$?")
     case "$RESULT" in
@@ -125,6 +139,10 @@ b2() {
 
 b3() { touch_block impostor "$IMPOSTOR_FINGER" "$B3_COUNT" "Use your LEFT INDEX finger (wrong finger on purpose). Touch when it says TOUCH NOW"; }
 
+q1() { touch_block genuine "$FINGER" "$QUICK_GENUINE" "RIGHT INDEX finger. Touch only when it says TOUCH NOW"; }
+q3() { touch_block impostor "$IMPOSTOR_FINGER" "$QUICK_IMPOSTOR" "Now LEFT INDEX finger (wrong on purpose). Touch when it says TOUCH NOW"; }
+qs() { sudo_block "$QUICK_SUDO"; }
+
 b4() {
     mark_start_time
     echo; say "=== HANDS OFF: do NOT touch the sensor for ~4 min ==="
@@ -140,12 +158,13 @@ b4() {
     marker_end
 }
 
-b5() {
+sudo_block() {
+    local count="$1"
     mark_start_time
-    echo; say "=== sudo test: when sudo says 'Place your finger', touch the sensor ==="; echo "    ($B5_COUNT times, no Enter needed)"
+    echo; say "=== sudo test: when sudo says 'Place your finger', touch the sensor ==="; echo "    ($count times, no Enter needed)"
     local i t0 t1
-    for ((i = 1; i <= B5_COUNT; i++)); do
-        echo; echo "[$i/$B5_COUNT]"
+    for ((i = 1; i <= count; i++)); do
+        echo; echo "[$i/$count]"
         next_run sudo
         marker_start sudo "$FINGER"
         t0=$(date +%s.%N)
@@ -153,9 +172,11 @@ b5() {
         t1=$(date +%s.%N)
         printf '   -> sudo finished in %.1fs\n' "$(echo "$t1 - $t0" | bc)"
         marker_end
-        if ((i < B5_COUNT)); then pause_next; fi
+        if ((i < count)); then pause_next; fi
     done
 }
+
+b5() { sudo_block "$B5_COUNT"; }
 
 b6() {
     mark_start_time
@@ -207,13 +228,16 @@ case "${1:-}" in
     all) run_set fresh "${2:-all}" b1 b2 b3 b4 b5 b6 ;;
     rest) run_set keep "${2:-final}" b2 b3 b4 b5 b6 ;;
     final) run_set fresh "${2:-final}" b1 b2 b3 b4 b5 b6 ;;
+    quick) [[ -n "$PAUSE_SECS_SET" ]] || PAUSE_SECS=1; run_set fresh "${2:-quick}" q1 q3 ;;
+    qsudo) [[ -n "$PAUSE_SECS_SET" ]] || PAUSE_SECS=1; run_set fresh "${2:-qsudo}" qs ;;
     baseline|test) run_set fresh "${2:-$1}" b1 b2 b3 b4 b5 ;;
     report) report "${2:-session}" ;;
     *)
-        echo "Usage: $0 b1|b2|b3|b4|b5|b6|all|rest|final|baseline|test|report [name]" >&2
+        echo "Usage: $0 b1|b2|b3|b4|b5|b6|all|rest|final|baseline|test|quick|qsudo|report [name]" >&2
         echo "  b1 genuine x$B1_COUNT, b2 finger-on-pad-first x$B2_COUNT, b3 impostor x$B3_COUNT," >&2
         echo "  b4 opens x$B4_COUNT, b5 sudo x$B5_COUNT, b6 suspend x$B6_COUNT." >&2
-        echo "  Env: FINGER, IMPOSTOR_FINGER, SINCE, VERIFY_TIMEOUT, GOODIX550C_MEASUREMENTS_DIR," >&2
+        echo "  quick = genuine x$QUICK_GENUINE then impostor x$QUICK_IMPOSTOR (~2 min), qsudo = sudo x$QUICK_SUDO; both report at the end." >&2
+        echo "  Env: QUICK_GENUINE, QUICK_IMPOSTOR, QUICK_SUDO, FINGER, IMPOSTOR_FINGER, SINCE, VERIFY_TIMEOUT, GOODIX550C_MEASUREMENTS_DIR," >&2
         echo "       LEAD_IN_SECS, B2_INTRO_SECS, HOLD_SECS, LIFT_GAP_SECS, PAUSE_SECS, RELEASE_SECS." >&2
         exit 2
         ;;

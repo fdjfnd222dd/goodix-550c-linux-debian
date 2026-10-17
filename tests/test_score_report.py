@@ -198,3 +198,52 @@ def test_field_parser_agrees_with_the_tui_parser():
                      for line in lines if "goodix550c open:" in line]
     assert t_open_fields == sec.opens
     assert sec.opens[0]["clear_ms"] == 45 and sec.opens[0]["up_wait_ms"] == 310
+
+
+def _timed_session():
+    def ph(kind, run, t, extra=""):
+        return f"{TAG}phase={kind} run={run}{extra} t_ms={t}"
+
+    lines = []
+    for run, (start, ready, res, down) in enumerate(
+            [(1000, 1100, 3100, 900), (10000, 10100, 14100, 1500), (20000, 20100, 21100, 700)], 1):
+        lines += [
+            f"{TAG}label=genuine finger=right-index run={run} t_ms={start}",
+            ph("ready", run, ready),
+            attempt("match", 500) + f" down_to_result_ms={down}",
+            ph("result", run, res, " result=match"),
+            f"{TAG}end run={run}",
+        ]
+    lines += [f"{TAG}label=impostor finger=left-index run=9 t_ms=30000",
+              ph("ready", 9, 30100),
+              attempt("no-match", 120), attempt("no-match", 149), attempt("no-match", 99),
+              ph("result", 9, 33000, " result=no-match"),
+              f"{TAG}end run=9"]
+    return "\n".join(lines)
+
+
+def test_time_to_result_near_misses_and_old_logs_null():
+    sections, _ = report.parse_sections(_timed_session())
+    labels = report.build_report(sections)["labels"]
+    g = labels["genuine"]
+    assert g["ready_to_result_median_ms"] == 2000
+    assert g["ready_to_result_p90_ms"] == 4000
+    assert g["run_total_median_ms"] == 2100
+    assert g["down_to_result_median_ms"] == 900
+    assert g["down_to_result_p90_ms"] == 1500
+    imp = labels["impostor"]
+    assert imp["near_misses"] == 2 and imp["impostor_max_score"] == 149
+    assert imp["ready_to_result_median_ms"] is None
+    old, _ = report.parse_sections(SESSION)
+    assert report.build_report(old)["labels"]["genuine"]["down_to_result_median_ms"] is None
+
+
+def test_compare_table(tmp_path, capsys):
+    cur = tmp_path / "cur.log"
+    cur.write_text(_timed_session(), encoding="utf-8")
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps({"labels": {"genuine": {"n": 20, "first_try_match_rate": 0.5}}}),
+                    encoding="utf-8")
+    assert report.main(["--log", str(cur), "--compare", str(base)]) == 0
+    out = capsys.readouterr().out
+    assert "first_try %" in out and "+50" in out and "[impostor]" in out
