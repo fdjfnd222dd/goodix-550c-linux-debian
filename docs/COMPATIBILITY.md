@@ -20,6 +20,8 @@ Source: linux-hardware.org device `usb:27c6-550c` (as of 2026-10-17: ~24 Yoga 9 
 
 Not the same machine: the **Yoga Pro 9 14IRP8** has no fingerprint reader.
 
+Already reflashed to firmware 13022 with brianporeilly's driver? This driver refuses 13022 (it only accepts the stock 13021 firmware and never writes to the sensor), so stay on his driver.
+
 ## Requirements beyond the laptop model
 
 - **Debian 13 (trixie), amd64.**
