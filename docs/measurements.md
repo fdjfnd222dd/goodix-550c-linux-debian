@@ -104,8 +104,8 @@ before re-enrolling and not worse than baseline; B3 0 accepts.
 |---|---|---|---|
 | c2 | `1.94.10+goodix550c2` | through 0015 (summary logging, no behaviour change) | baseline |
 | c3 | `1.94.10+goodix550c3` | adds 0016 (drain, PSK-hash check, one TLS retry) | stale-TLS fix |
-| c4 | `1.94.10+goodix550c4` | TODO: confirm patch set (0017 and/or 0018) | capture guards |
-| post-re-enroll | TODO: final build | all patches; prints re-enrolled | final validation |
+| c4 | `1.94.10+goodix550c4` | 0015–0018 | stale-TLS fix + capture guards |
+| c5 | `1.94.10+goodix550c5` | 0015–0019 | touch-direction finger-down (release build) |
 
 ## Results (2026-10-17, one person, one Yoga 9 14IAP7)
 
@@ -136,7 +136,4 @@ Other observations:
   window; revisit to 10 after the capture guards are measured.
 - `max-tries=1` avoids retrying with the finger still down; revisit to 2 only if the
   B1/B5 data say so.
-- `GOODIX_REF_FINGER_MEAN_MAX` ships as 2000 (empty pad about 2350, finger 1490-1600
-  in earlier observations). The plan intended to derive it from the baseline
-  `ref_mean` split of B1 vs B2 (midpoint, at least 150 margin each side). TODO: do
-  that from the c2 data and record the chosen value.
+- `GOODIX_REF_FINGER_MEAN_MAX` = 2000, checked against the c2 data: empty-pad references 2247–2267, finger-on-pad references 200–1232. 2000 leaves ≥ 247 margin on the empty side and ≥ 768 on the finger side, so it was kept.
