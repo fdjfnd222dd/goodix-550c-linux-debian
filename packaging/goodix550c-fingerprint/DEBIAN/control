@@ -1,5 +1,5 @@
 Package: goodix550c-fingerprint
-Version: 1.1.3
+Version: 1.1.4
 Architecture: all
 Maintainer: Local goodix550c build <noreply@localhost>
 Section: utils
