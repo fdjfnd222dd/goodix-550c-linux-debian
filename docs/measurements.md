@@ -1,7 +1,7 @@
 # Measurements (Debian reliability work)
 
 Status: the protocol and the report tool exist; **no numbers have been collected yet**.
-Every `TODO` cell below is a placeholder to be filled from
+Results below were measured with
 `research/baseline/<date>-<build>.json` (git-ignored; only the non-identifying
 summary below is committed). Do not paste journal excerpts, finger names beyond
 "index"/"thumb", scores tied to a person, or anything from the PSK, OTP, frames or
@@ -107,74 +107,28 @@ before re-enrolling and not worse than baseline; B3 0 accepts.
 | c4 | `1.94.10+goodix550c4` | TODO: confirm patch set (0017 and/or 0018) | capture guards |
 | post-re-enroll | TODO: final build | all patches; prints re-enrolled | final validation |
 
-## Results
+## Results (2026-10-17, one person, one Yoga 9 14IAP7)
 
-Fill from the JSON for each build. `n` is runs, `1st` first-try match rate, `<=2`
-match-within-2 rate. Scores are best SIGFM score against threshold 150.
+`c3` (0016 alone) was not measured separately; the stale-TLS fix was validated as part of `c4`
+with the old ExecStartPre/sleep-hook workarounds removed. Small samples: 20 runs ≈ ±10 points.
 
-### B1 genuine (target: first try >= 90%, within 2 >= 97%)
-
-| Build | Date | n | attempts | 1st | <=2 | Retry reasons | Score min / median / max |
-|---|---|---|---|---|---|---|---|
-| c2 baseline | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| c3 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| c4 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| post-re-enroll | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-
-### B2 present-at-start (target: 0 finger-on references, within 2 >= 90%, <= 1 "remove finger"/run)
-
-| Build | Date | n | <=2 | `retry:remove-finger` | `retry:finger-present` | Min `ref_mean` stored | Score median |
-|---|---|---|---|---|---|---|---|
-| c2 baseline | TODO | TODO | TODO | TODO | n/a (before 0017) | TODO | TODO |
-| c3 | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
-| c4 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| post-re-enroll | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-
-### B3 impostor (target: 0 accepts over at least 30 total touches)
-
-| Build | Date | n | Accepts | Max impostor score (threshold 150) |
-|---|---|---|---|---|
-| c2 baseline | TODO | TODO | TODO | TODO |
-| c3 | TODO | TODO | TODO | TODO |
-| c4 | TODO | TODO | TODO | TODO |
-| post-re-enroll | TODO | TODO | TODO | TODO |
-
-### B4 opens and recovery cases (target: 0 failures out of at least 120)
-
-| Build | Opens | Failures (by phase) | `tls_retry` > 0 | Median open ms | Resume x10 ok | fprintd-kill x10 ok |
+| Build | Prints | B1 genuine first try | B2 finger-already-down ≤2 tries | B3 impostor accepts (max score) | B5 sudo first try | Opens failed |
 |---|---|---|---|---|---|---|
-| c2 baseline (workarounds off) | TODO | TODO | n/a | TODO | TODO | TODO |
-| c3 | TODO | TODO | TODO | TODO | TODO | TODO |
-| c4 | TODO | TODO | TODO | TODO | TODO | TODO |
-| post-re-enroll | TODO | TODO | TODO | TODO | TODO | TODO |
+| c2 baseline (0015 logging only, workarounds on) | old | 75% (≤2: 80%) | 50% | 0 / 8 (2) | 80% (old PAM, 3 tries) | 0 / 59 |
+| c4 (0015–0018, workarounds off) | old | 85% | 88% | 0 / 8 (3) | 70% (≤2: 80%) | 0 / 58 |
+| c4 | re-enrolled (17 stages) | — | 75% | 0 / 8 (2) | 40% (≤2: 80%)* | 0 / 56 |
+| c5 (+0019 touch direction) | re-enrolled | 85% | — | — | **80%** | 0 / 30 |
 
-Wrong-PSK fail-closed check (scratch override, one time): TODO.
+\* the `retry:too-short` misses that 0019 targets: every one had a lift-direction trigger
+(`dmax_pos` +45…+50, `dmax_neg` 0) while every real touch had `dmax_neg` −42…−49.
 
-### B5 sudo (target: median touch-to-success <= 3 s; no-touch fallback <= 16 s)
-
-| Build / PAM | Date | n | Median touch-to-success (s) | No-touch fallback (s) | "already claimed" in journal |
-|---|---|---|---|---|---|
-| Before WP2 (common-auth, 22-30 s waits) | TODO | TODO | TODO | TODO | TODO |
-| After profile (max-tries=1 timeout=15) | TODO | TODO | TODO | TODO | TODO |
-| post-re-enroll | TODO | TODO | TODO | TODO | TODO |
-
-### B6 lock screen after suspend (target: 10/10 within 2 attempts)
-
-| Build | Date | Rounds | Pass | Fail | "already claimed" |
-|---|---|---|---|---|---|
-| c3 | TODO | TODO | TODO | TODO | TODO |
-| post-re-enroll | TODO | TODO | TODO | TODO | TODO |
-
-### Cold boot, polkit, updates, drills
-
-| Check | Date | Result |
-|---|---|---|
-| 3 cold boots (SDDM password, lock, finger unlock) | TODO | TODO |
-| 5x `pkexec true` | TODO | TODO |
-| `apt full-upgrade -s` keeps libfprint and the config package | TODO | TODO |
-| Timeshift drill (commands, minutes) | TODO | TODO |
-| Rollback drill (stock, password, reinstall, B1 x5) | TODO | TODO |
-| `check_no_secrets.py` | TODO | TODO |
+Other observations:
+- Reference means: empty pad 2247–2267; finger-on-pad references 200–1232 → `GOODIX_REF_FINGER_MEAN_MAX` 2000 keeps ≥ 247 margin on the empty side.
+- Median genuine score rose from ~640 (old prints) to ~4,500 (re-enrolled with c4/c5).
+- Lock screen after suspend (c4, re-enrolled): 2 / 3 first try, 3 / 3 within 2 tries, 0 "Device was already claimed" after the PAM profile change.
+- Remaining genuine misses have a good reference, 140–200 keypoints and best score 0–40: partial overlap between probe and templates, not capture faults — the target of the tuning campaign in [EXPERIMENTS.md](EXPERIMENTS.md).
+- Secret scan (`check_no_secrets.py`, full mode with the real PSK, history + release deb): clean.
+- Not yet run: Timeshift restore drill, 3 cold boots, polkit ×5, 30+ impostor touches.
 
 ## Notes for the next revision
 
