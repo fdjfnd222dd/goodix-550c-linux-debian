@@ -26,6 +26,9 @@ Options:
                      patches/goodix-550c/driver-series)
   --work DIR         staging root (default: build/pkg); DIR/libfprint-2-2 is
                      wiped on every run
+  --pkg NAME         package to build: libfprint-2-2 (default) or
+                     goodix550c-fingerprint (arch all, from
+                     packaging/goodix550c-fingerprint/; uses --out and --work only)
   -h, --help         this help
 USAGE
 }
@@ -36,6 +39,7 @@ N=""
 STOCK="$HOME/goodix550c-debs/stock/libfprint-2-2_1%3a1.94.9-1_amd64.deb"
 SERIES="$ROOT/patches/goodix-550c/driver-series"
 WORK="$ROOT/build/pkg"
+PKG_SEL=libfprint-2-2
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -47,6 +51,7 @@ while [ $# -gt 0 ]; do
     --stock-deb) STOCK="${2:?--stock-deb needs a value}"; shift 2 ;;
     --series) SERIES="${2:?--series needs a value}"; shift 2 ;;
     --work) WORK="${2:?--work needs a value}"; shift 2 ;;
+    --pkg) PKG_SEL="${2:?--pkg needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
   esac
@@ -55,6 +60,38 @@ done
 for tool in dpkg-deb sha256sum md5sum gzip awk sed; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
+
+build_fingerprint_pkg() {
+  local name=goodix550c-fingerprint src="$ROOT/packaging/goodix550c-fingerprint"
+  local stage="$WORK/$name" version deb size
+  [ -f "$src/DEBIAN/control" ] || die "missing $src/DEBIAN/control"
+  version="$(sed -n 's/^Version: *//p' "$src/DEBIAN/control" | head -n 1)"
+  [ -n "$version" ] || die "no Version in control"
+  deb="$OUT/${name}_${version}_all.deb"
+  mkdir -p "$OUT"
+  [ ! -e "$deb" ] || die "refusing to overwrite existing $deb (bump Version in control or remove it yourself)"
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  cp -a "$src/." "$stage/"
+  find "$stage" -type d -exec chmod 0755 {} +
+  find "$stage" -type f -not -path "$stage/DEBIAN/*" -exec chmod 0644 {} +
+  chmod 0755 "$stage/usr/sbin/goodix550c-ctl"
+  size="$(du -sk --exclude=DEBIAN "$stage" | cut -f1)"
+  sed -i "s/@INSTALLED_SIZE@/$size/g" "$stage/DEBIAN/control"
+  ( cd "$stage" && find . -path ./DEBIAN -prune -o -type f -print | LC_ALL=C sort | sed 's|^\./||' | xargs -d '\n' md5sum ) > "$stage/DEBIAN/md5sums"
+  chmod 0644 "$stage/DEBIAN/control" "$stage/DEBIAN/md5sums" "$stage/DEBIAN/conffiles"
+  for s in preinst postinst prerm postrm; do chmod 0755 "$stage/DEBIAN/$s"; done
+  dpkg-deb --root-owner-group --build "$stage" "$deb" >/dev/null
+  ( cd "$OUT" && sha256sum -- *.deb > SHA256SUMS )
+  echo "built:   $deb"
+  echo "sha256:  $(sha256sum "$deb" | cut -d' ' -f1)"
+}
+
+case "$PKG_SEL" in
+  goodix550c-fingerprint) build_fingerprint_pkg; exit 0 ;;
+  libfprint-2-2) ;;
+  *) die "unknown --pkg: $PKG_SEL" ;;
+esac
 
 if [ -z "$SO" ]; then
   SO="$(find "$ROOT/build/rebuild-vi-mfp/builddir" -name libfprint-2.so.2.0.0 -print -quit 2>/dev/null || true)"

@@ -1,0 +1,1 @@
+ACTION=="add|bind", SUBSYSTEM=="usb", ATTR{idVendor}=="27c6", ATTR{idProduct}=="550c", TEST=="power/control", ATTR{power/control}="on"

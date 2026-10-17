@@ -1,0 +1,2 @@
+/etc/tlp.d/50-goodix550c.conf
+/etc/apt/preferences.d/goodix550c-libfprint
