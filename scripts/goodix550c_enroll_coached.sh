@@ -23,10 +23,10 @@ PLACES=(middle middle fingertip fingertip "lower part of finger" "lower part of 
         "roll RIGHT" middle "tip, roll left" "tip, roll right" "low, roll left" "low, roll right"
         middle middle middle middle middle middle)
 else
-PLACES=(normal normal normal "normal, a bit higher" "normal, a bit lower" normal
-        "normal, a bit left" "normal, a bit right" normal "normal, a bit higher" "normal, a bit lower" normal
-        "normal, slightly tilted" normal "normal, a bit left" "normal, a bit right" normal normal
-        "normal, a bit higher" "normal, a bit lower" normal normal normal normal
+PLACES=(normal normal normal "normal, a bit higher" "normal, a bit lower" "more FINGERTIP"
+        "normal, a bit left" "normal, a bit right" normal "more FINGERTIP" "normal, a bit lower" normal
+        "normal, slightly tilted" "more FINGERTIP" "normal, a bit left" "normal, a bit right" normal "fast light tap"
+        "normal, a bit higher" "more FINGERTIP" normal "fast light tap" normal normal
         normal normal normal normal normal normal)
 fi
 
