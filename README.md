@@ -72,24 +72,30 @@ sudo goodix550c-ctl pam enable
 - **`finger` TUI** (package `goodix550c-fingerprint` >= 1.1.0): a full-screen terminal app
   that makes enrolling and testing hard to get wrong. Run `finger` (alias
   `goodix550c-tui`; the package declares `Conflicts: finger` because Debian's unrelated
-  `finger` package owns that command name). Pages: `1` Home (sensor, driver, saved fingers
-  on two hands, last 10 tries with score bars against the threshold 150), `2` Enroll
-  (a big fingerprint fills as each scan passes: green PRESS, orange LIFT, red TRY AGAIN,
-  cyan DONE), `3` Test (MATCH / NO MATCH with the score), `4` Settings (tries 1-5, sudo
-  timeout 5-30 s, fingerprint for sudo/polkit on or off), `5` Help. Keys: arrows or
-  `h j k l`, Enter, Esc, `d` delete, `?` help, `q` quit. Settings that need root show the
+  `finger` package owns that command name). Pages: `1` Home (a dashboard: both hands with
+  the saved fingers, a status checklist with a one-line fix next to anything wrong, every
+  logged try with its score on a log-scale bar against the threshold 150 and the result in
+  plain words, and today's first-try match rate, median score and missed-try reasons from
+  the driver's journal lines), `2` Enroll (pick a finger on the hands, then a big
+  fingerprint fills up ridge by ridge, one step per accepted scan: green PRESS, orange LIFT,
+  red TRY AGAIN, cyan DONE), `3` Test (MATCH / NO MATCH with the score), `4` Settings
+  (tries 1-5, sudo timeout 5-30 s, fingerprint for sudo/polkit on or off, and a picture of
+  what sudo will do), `5` Help. Keys: arrows or `h j k l`, Enter, Esc, `e`/`t`/`s` jump to
+  Enroll/Test/Settings, `d` delete, `?` help, `q` quit. Settings that need root show the
   exact `sudo goodix550c-ctl pam set ...` line first and run it in your normal terminal,
   so sudo asks for the password there. `finger --demo` runs on made-up data without the
   sensor. It needs `python3-textual (>= 2.1)` and `python3-rich`; it was tested on
   textual 2.1.2 / rich 13.9.4 (Debian 13). Source: `tui/goodix550c_tui/`; tests:
-  `build/tui-venv/bin/python -m pytest tests/tui`; screenshots (demo):
-  `docs/img/finger-home.svg`, `finger-enroll.svg`, `finger-test.svg`
-  (`scripts/make_tui_screenshots.py` regenerates them). The command-line equivalent of the
+  `build/tui-venv/bin/python -m pytest tests/tui`; screenshots (demo data, 160x45):
+  `docs/img/finger-{home,enroll,test,settings}.png` (+ `.svg`);
+  `scripts/make_tui_screenshots.py --png` regenerates them (`--all` renders every state at
+  120x35 and 200x50). The command-line equivalent of the
   settings page is `sudo goodix550c-ctl pam set --tries N --timeout S` (saved in
   `/etc/goodix550c/pam.conf`, kept across package upgrades); `goodix550c-ctl status --json`
   is what the TUI reads.
 
-![finger enroll page (demo)](docs/img/finger-enroll.svg)
+![finger home page (demo)](docs/img/finger-home.png)
+![finger enroll page (demo)](docs/img/finger-enroll.png)
 
 - **When something breaks** (Timeshift restore, update, bad PAM change): see
   [docs/RECOVERY.md](docs/RECOVERY.md). Measurement method and results:

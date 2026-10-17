@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -9,9 +10,13 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
 from goodix550c_tui import art
-from goodix550c_tui.art import BLUE, CYAN, DIM, FG, GREEN, ORANGE, RED
-from goodix550c_tui.parsers import FINGERS, THRESHOLD, Attempt, Status, pretty, validate_settings
-from goodix550c_tui.widgets import ConfirmScreen, FingerprintView, HandsPicker, selection_line
+from goodix550c_tui.art import (BG, BLUE, CYAN, DIM, FAINT, FG, GREEN, KIND_COLOUR, ORANGE, RED, WHITE,
+                                hcat, wrap)
+from goodix550c_tui.parsers import (FINGERS, RESULT_HELP, THRESHOLD, Attempt, Stats, Status, plain_result,
+                                    pretty, summarise, validate_settings)
+from goodix550c_tui.widgets import ConfirmScreen, FingerprintView, Panel, keys_line, selection_line
+
+Keys = list[tuple[str, str]]
 
 
 def kv(label: str, value, style: str = FG, lw: int = 15) -> Text:
@@ -21,10 +26,8 @@ def kv(label: str, value, style: str = FG, lw: int = 15) -> Text:
     return t
 
 
-def yes_no(ok: bool | None, good: str, bad: str, unknown: str = "not checked") -> Text:
-    if ok is None:
-        return Text(f"? {unknown}", style=DIM)
-    return Text(f"✔ {good}", style=f"bold {GREEN}") if ok else Text(f"✘ {bad}", style=f"bold {RED}")
+def today() -> str:
+    return _dt.date.today().isoformat()
 
 
 class Page(Vertical):
@@ -40,75 +43,332 @@ class Page(Vertical):
     def cancel(self) -> None: ...
     def delete(self) -> None: ...
     def apply(self) -> None: ...
-    def hint(self) -> str:
-        return ""
+    def hint(self) -> Keys:
+        return []
 
     @property
     def fa(self):           # the App
         return self.app
 
 
+NAV: Keys = [("Tab", "next page"), ("?", "help"), ("q", "quit")]
+
+
+# --------------------------------------------------------------------------
+# shared panels
+# --------------------------------------------------------------------------
+class FingersPanel(Panel):
+    """The two hands with the chosen finger, plus the saved list when there is room."""
+
+    def __init__(self, title: str, action: str = "save it", cta: bool = False, **kw):
+        super().__init__(title, art.B_BLUE, **kw)
+        self.action = action
+        self.cta = cta
+
+    def build(self, w, h):
+        a = self.app
+        f = a.sel_finger
+        big = w >= art.BIG_HANDS_W + 4 and h >= art.BIG_HAND_H + (8 if self.cta else 4)
+        hands = art.hands_lines(a.enrolled, f, big=big)
+        hands_w = art.hands_size(big)[0]
+        foot = [Text(), selection_line(f, a.enrolled)]
+        if self.cta:
+            b = Text(no_wrap=True)
+            b.append(" Enter ", f"bold {BG} on {GREEN}")
+            b.append(f"  {'save it again' if f in a.enrolled else 'save this finger'}", f"bold {GREEN}")
+            foot += [Text(), b, Text(),
+                     keys_line([("←→", "finger"), ("↑↓", "other hand"), ("d", "delete")])]
+        else:
+            foot.append(keys_line([("←→", "finger"), ("↑↓", "other hand"), ("Enter", self.action),
+                                   ("d", "delete")]))
+        side_w = min(34, w - hands_w - 6)
+        if side_w >= 24:
+            saved = [x for x in FINGERS if x in a.enrolled]
+            side = [Text(f"Saved  {len(saved)} of 10", style=f"bold {FG}"), Text()]
+            for x in saved:
+                t = Text("● ", style=f"bold {GREEN}")
+                t.append(pretty(x), FG)
+                side.append(t)
+            if not saved:
+                side += wrap("None yet. Pick a finger and press Enter to save it.", side_w, DIM)
+            elif len(saved) < 2:
+                side += [Text()] + wrap("Tip: save a second finger in case one is sore or wet.", side_w, DIM)
+            block_w = hands_w + 6 + side_w
+            body = hcat([hands, side], [hands_w, side_w], gap=6)
+            pad = Text(" " * max(0, (w - block_w) // 2))
+            lines = [pad + ln for ln in body] + [pad + ln for ln in foot]
+        else:
+            lines = [art.centre(ln, w) for ln in hands] + [art.centre(ln, w) for ln in foot]
+        top = max(0, (h - len(lines)) // 2)
+        return [Text()] * top + lines
+
+
 # --------------------------------------------------------------------------
 # 1 Home
 # --------------------------------------------------------------------------
-BAR_W = 36
+def ordinal(n: int) -> str:
+    return {1: "1st", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
 
 
-def score_bar(score: int, threshold: int, ok: bool, scale: int) -> Text:
-    """Bar of `score` on a 0..scale line with a marker at the threshold."""
-    mark = min(BAR_W - 1, round(threshold / scale * BAR_W))
-    on = min(BAR_W, round(score / scale * BAR_W))
-    colour = GREEN if ok else RED
+def try_numbers(attempts: list[Attempt]) -> list[int]:
+    """1 for the first attempt of a session, 2 for the second... 0 = unknown session."""
+    out, count = [], {}
+    for a in attempts:
+        if a.session < 0:
+            out.append(0)
+            continue
+        count[a.session] = count.get(a.session, 0) + 1
+        out.append(count[a.session])
+    return out
+
+
+def attempt_line(a: Attempt, nth: int, bar_w: int, time_w: int, wide_help: int = 0, day: str = "") -> Text:
+    words, kind = plain_result(a.result)
+    colour = KIND_COLOUR[kind]
     t = Text(no_wrap=True)
-    for i in range(BAR_W):
-        if i == mark:
-            t.append("│", f"bold {art.FG}")
-        elif i < on:
-            t.append("█", colour)
-        else:
-            t.append("·", art.TRACK)
+    when = a.time or "--:--:--"
+    if time_w > 8:
+        when = (a.date[5:] + " " + a.time[:5]) if a.date and a.date != day else when
+    t.append(f"{when:<{time_w}} ", DIM)
+    t.append(f"{ordinal(nth) if nth else '':<4} ", FG if nth == 1 else DIM)
+    t.append_text(art.score_bar(a.best_score if a.scored else None, bar_w, colour, a.threshold))
+    t.append(f" {a.best_score if a.scored else '':>6}  ", f"bold {FG}")
+    t.append("✓ " if kind == "match" else "✗ " if kind == "nomatch" else "↻ ", f"bold {colour}")
+    t.append(f"{words:<26}" if wide_help else words, f"bold {colour}" if kind != "retry" else colour)
+    if wide_help and kind != "match":
+        t.append(RESULT_HELP.get(a.result, ""), FAINT)
     return t
 
 
-def attempt_line(a: Attempt, scale: int) -> Text:
-    t = Text(no_wrap=True)
-    t.append(f"{a.time or '--:--:--':<9} ", DIM)
-    t.append(f"{a.action[:8] or '?':<9}", FG)
-    if a.retry:
-        t.append_text(score_bar(0, a.threshold, False, scale))
-        t.append(f"  {'-':>4}  ", DIM)
-        t.append(f"retry ({a.result.split(':', 1)[-1]})", ORANGE)
+class TriesPanel(Panel):
+    def build(self, w, h):
+        atts = self.app.attempts
+        if not atts:
+            return [Text("No tries logged yet.", style=FG), Text(),
+                    *wrap("Every fingerprint check (sudo, a password pop-up or the Test page) is logged by "
+                          "the driver and shows up here with its score.", w, DIM), Text(),
+                    keys_line([("t", "test a finger now")])]
+        day = today()
+        nths = try_numbers(atts)
+        rows = max(1, h - 2)
+        pairs = list(zip(atts, nths))[-rows:][::-1]
+        time_w = 11 if any(a.date and a.date != day for a, _ in pairs) else 8
+        fixed = time_w + 1 + 5 + 7 + 2 + 2          # time, try, score, gaps, mark
+        result_w = 25
+        bar_w = max(12, min(48, w - fixed - result_w))
+        wide = w - fixed - bar_w - 28 >= 30
+        head = Text(no_wrap=True)
+        head.append(f"{'time':<{time_w}} {'try':<5}", DIM)
+        head.append(f"{'score (log scale, │ = ' + str(THRESHOLD) + ')':<{bar_w}}", DIM)
+        head.append(f" {'':>6}    result", DIM)
+        lines = [head]
+        lines += [attempt_line(a, n, bar_w, time_w, wide, day) for a, n in pairs]
+        for i in range(1, len(lines)):                 # long help text: end with an ellipsis
+            if lines[i].cell_len > w:
+                lines[i] = art.fit(lines[i], w - 1) + Text("…", style=FAINT)
+        axis = Text(" " * (time_w + 6), no_wrap=True)
+        axis.append_text(art.score_axis(bar_w))
+        if w - axis.cell_len >= 40:
+            axis.append(f"         │ {THRESHOLD} = the score a match needs", FAINT)
+        lines.append(axis)
+        self.border_subtitle = f"newest first · {len(atts)} in the log"
+        return lines
+
+
+TIPS = [
+    "touch with the flat middle of the pad.",
+    "cold or dry fingers score lower.",
+    "lift your finger before sudo asks.",
+    "save one finger as two for better odds.",
+    "your password always works too.",
+]
+
+
+def _stat(label: str, value: str, caption: str, colour: str, big: bool) -> list[Text]:
+    out = [Text(label, style=f"bold {DIM}", no_wrap=True)]
+    if big:
+        out += art.big_number(value, colour)
     else:
-        t.append_text(score_bar(a.best_score, a.threshold, a.matched, scale))
-        t.append(f"  {a.best_score:>4}  ", f"bold {FG}")
-        t.append("match" if a.matched else "no match", f"bold {GREEN}" if a.matched else f"bold {RED}")
-    return t
+        out.append(Text(value, style=f"bold {colour}"))
+    out.append(Text(caption, style=DIM, no_wrap=True))
+    return out
+
+
+class TodayPanel(Panel):
+    tip_index = 0
+
+    def build(self, w, h):
+        st: Stats = summarise(self.app.attempts, today())
+        self.border_title = "Today" if st.scope == "today" else "Recent tries"
+        self.border_subtitle = "" if st.scope == "today" else "none today"
+        ft = st.first_try_pct
+        stats = [
+            ("1ST TRY", "-" if ft is None else f"{ft}%",
+             f"{st.first_try} of {st.sessions}" if st.sessions else "no prompts",
+             DIM if ft is None else (GREEN if ft >= 80 else ORANGE if ft >= 50 else RED)),
+            ("MEDIAN", "-" if st.median_score is None else str(st.median_score),
+             f"needs {THRESHOLD}",
+             DIM if st.median_score is None else (GREEN if st.median_score >= THRESHOLD else RED)),
+            ("TRIES", str(st.tries), f"{st.matches}✓ {st.nomatches}✗ {st.retries}↻", CYAN),
+        ]
+        colw = (w - 2) // 3
+        big = all(art.big_number_width(v) <= colw for _, v, _, _ in stats) and h >= 9
+        blocks = [_stat(lbl, v, cap, col, big) for lbl, v, cap, col in stats]
+        lines = hcat(blocks, [colw] * 3, gap=1)
+        if w >= 56 and st.sessions:
+            lines.append(Text(f"first touch matched in {st.first_try} of {st.sessions} prompts"
+                              + (f" · best score {st.best_score}" if st.best_score else ""), style=FAINT))
+        actions = [keys_line([("e", "save a finger"), ("t", "test"), ("s", "settings"), ("?", "help")])]
+        tip = [art.fit(Text("Tip: " + TIPS[self.tip_index % len(TIPS)], style=FAINT, no_wrap=True), w)]
+        # what went wrong, in plain words, most common first
+        why: dict[str, tuple[int, str]] = {}
+        for a in st.attempts:
+            words, kind = plain_result(a.result)
+            if kind != "match":
+                n, _ = why.get(words, (0, kind))
+                why[words] = (n + 1, kind)
+        wrong = sorted(why.items(), key=lambda kv: -kv[1][0])
+        room = h - len(lines) - len(actions) - len(tip)
+        wrong_rows = min(len(wrong), max(0, room - 9)) if wrong else 0
+        graph_rows = min(14, room - (wrong_rows + 2 if wrong_rows else 0) - 3)
+        if st.attempts and graph_rows >= 3:
+            items = []
+            for a in st.attempts:
+                _, kind = plain_result(a.result)
+                items.append((a.best_score if a.scored else None, KIND_COLOUR[kind]))
+            lines += [Text(), Text("score of each try, oldest → newest", style=DIM)]
+            lines += art.score_columns(items, w, graph_rows)
+        if wrong_rows:
+            lines += [Text(), Text("Missed tries", style=DIM)]
+            for words, (n, kind) in wrong[:wrong_rows]:
+                t = Text(f"{n:>3}× ", style=f"bold {KIND_COLOUR[kind]}")
+                t.append(words, FG)
+                lines.append(t)
+        lines += [Text()] * max(0, h - len(lines) - len(actions) - len(tip))
+        return lines + actions + tip
+
+
+def _check(ok, label, value, fix="", why=""):
+    return (ok, label, value, fix, why)
+
+
+def status_checks(s: Status, enrolled: set[str], opens) -> list[tuple]:
+    out = []
+    out.append(_check(s.sensor_present, "Sensor", "found" if s.sensor_present else "not found",
+                      "enable it in the BIOS, then: sudo goodix550c-ctl recover", "Goodix 27c6:550c on USB"))
+    lib = (s.libfprint_version or "").split("+")[-1] if s.patched else "stock (no 550c support)"
+    out.append(_check(s.patched, "Driver", lib or "patched",
+                      "install the patched libfprint (see docs/RECOVERY.md)", "patched libfprint is installed"))
+    out.append(_check(s.held, "Kept on update", "held" if s.held else "not held",
+                      "sudo apt-mark hold libfprint-2-2", "apt keeps the patched one"))
+    out.append(_check(s.psk_present, "Sensor key", {True: "installed", False: "missing",
+                                                     None: "needs admin to check"}[s.psk_present],
+                      "sudo goodix550c-ctl install-psk FILE", "pairing key, root only"))
+    out.append(_check(s.store_ok, "Saved prints", "private" if s.store_ok else "readable by others",
+                      "sudo goodix550c-ctl harden-store", "only root can read /var/lib/fprint"))
+    if s.sensor_present and s.usb_power:
+        out.append(_check(s.usb_power == "on", "USB power", "always on" if s.usb_power == "on" else
+                          f"{s.usb_power} (may sleep)", "sudo goodix550c-ctl recover",
+                          "no autosuspend, no missed touches"))
+    if opens:
+        o = opens[-1]
+        good = o.result == "ok"
+        out.append(_check(good, "Last start", f"ok in {o.ms} ms" if good else f"failed at {o.phase}",
+                          "sudo goodix550c-ctl recover", f"sensor handshake at {o.time[:5]}" if o.time else
+                          "sensor handshake"))
+    pam = f"on · {s.pam_tries} tries · {s.pam_timeout} s" if s.pam_enabled else "off"
+    out.append(_check(True if s.pam_enabled else None, "sudo & pop-ups", pam, "press s to turn it on",
+                      "password still works"))
+    out.append(_check(bool(enrolled), "Saved fingers", f"{len(enrolled)} of 10" if enrolled else "none",
+                      "press e to save one", "see the hands"))
+    return out
+
+
+class StatusPanel(Panel):
+    def build(self, w, h):
+        a = self.app
+        s = a.status
+        if s is None:
+            return [Text("looking...", style=DIM)]
+        if s.error:
+            return [Text("✗ Could not read the status", style=f"bold {RED}"), Text()] + wrap(s.error, w, RED) + \
+                   [Text()] + wrap("Is goodix550c-fingerprint installed? Try: goodix550c-ctl status", w, DIM)
+        checks = status_checks(s, a.enrolled, a.opens)
+        bad = [c for c in checks if c[0] is False]
+        head = Text(no_wrap=True)
+        if not bad:
+            head.append("✓ All good", f"bold {GREEN}")
+            head.append("  - the fingerprint is ready to use" if s.pam_enabled else
+                        "  - sudo is not using it yet (s)", DIM)
+        else:
+            head.append(f"✗ {len(bad)} thing{'s' if len(bad) > 1 else ''} to fix", f"bold {RED}")
+            head.append("  - how, in orange", DIM)
+        ncol = 2 if w >= 2 * 60 + 3 else 1
+        colw = (w - 3 * (ncol - 1)) // ncol
+        lw = 16
+        vw = max(len(c[2]) for c in checks) + 3
+        show_why = colw >= 2 + lw + vw + max(len(c[4]) for c in checks if c[0] is not False)
+
+        def render(c):
+            ok, label, value, fix, why = c
+            mark, ms = ("✓", f"bold {GREEN}") if ok else (("✗", f"bold {RED}") if ok is False else ("○", DIM))
+            t = Text(no_wrap=True)
+            t.append(mark + " ", ms)
+            t.append(f"{label:<{lw}}", DIM)
+            t.append(f"{value:<{vw}}" if show_why else value, (FG if ok else RED if ok is False else DIM))
+            if show_why and ok is not False:
+                t.append(why, FAINT)
+            out = [t]
+            if ok is False:
+                out.append(Text("  → " + fix, style=ORANGE, no_wrap=True))
+            return out
+
+        rendered = [render(c) for c in checks]
+        need = sum(len(r) for r in rendered)
+        room = h - 2
+        if ncol == 1 and need > room:                  # squeeze: fold the fine ones into one line
+            fine = [c[1].lower() for c in checks if c[0]]
+            rendered = [render(c) for c in checks if not c[0]]
+            t = Text("✓ ", style=f"bold {GREEN}")
+            t.append("fine: " + ", ".join(fine), DIM)
+            rendered.append([t])
+        flat = [ln for r in rendered for ln in r]
+        if ncol == 2:
+            half = (len(rendered) + 1) // 2
+            left = [ln for r in rendered[:half] for ln in r]
+            right = [ln for r in rendered[half:] for ln in r]
+            flat = hcat([left, right], [colw, colw], gap=3)
+        lines = [head, Text()] + flat
+        extra = []
+        if s.package_version or s.libfprint_version:
+            ver = f"libfprint {s.libfprint_version.split(':')[-1] or '?'}"
+            if len(ver) + 16 <= w:
+                ver += f" · package {s.package_version or '?'}"
+            extra.append(Text(ver, style=FAINT, no_wrap=True))
+        if len(lines) + len(extra) + 1 <= h:
+            lines += [Text()] * (h - len(lines) - len(extra)) + extra
+        return lines
 
 
 class HomePage(Page):
     DEFAULT_CSS = """
-    HomePage #home-top { height: auto; }
-    HomePage #home-hands { width: 87; height: auto; border: round #4ea1ff; border-title-color: #4ea1ff; padding: 0 1; }
-    HomePage #home-device { width: 1fr; height: 100%; min-width: 30; border: round #5fa86b; border-title-color: #5fa86b; padding: 0 1; }
-    HomePage #home-attempts { height: 1fr; border: round #d9a441; border-title-color: #d9a441; padding: 0 1; }
+    HomePage .row { height: 1fr; }
+    HomePage #home-r1 { height: 15; }
+    HomePage .left { width: 3fr; min-width: 78; }
+    HomePage .right { width: 2fr; min-width: 36; }
     """
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="home-top"):
-            with Vertical(id="home-hands"):
-                yield HandsPicker(id="home-picker")
-                yield Static(id="home-sel")
-            yield Static(id="home-device")
-        yield Static(id="home-attempts")
+        with Horizontal(id="home-r1", classes="row"):
+            yield FingersPanel("Your fingers", id="home-hands", classes="left")
+            yield StatusPanel("This computer", art.B_GREEN, id="home-device", classes="right")
+        with Horizontal(id="home-r2", classes="row"):
+            yield TriesPanel(f"Recent tries", art.B_GOLD, id="home-attempts", classes="left")
+            yield TodayPanel("Today", art.B_PURPLE, id="home-today", classes="right")
 
-    def on_mount(self) -> None:
-        self.query_one("#home-hands").border_title = "Your fingers"
-        self.query_one("#home-device").border_title = "This computer"
-        self.query_one("#home-attempts").border_title = f"Last 10 tries (a match needs {THRESHOLD}+)"
-        self.refresh_view()
-
-    def hint(self) -> str:
-        return "←→↑↓ choose finger   Enter save it   d delete it   r refresh   Tab next page   ? help   q quit"
+    def hint(self) -> Keys:
+        return [("←→↑↓", "choose finger"), ("Enter", "save it"), ("d", "delete it"), ("e t s", "pages"),
+                ("r", "refresh")] + NAV
 
     def move(self, dx, dy):
         self.fa.move_selection(dx, dy)
@@ -119,56 +379,13 @@ class HomePage(Page):
     def delete(self):
         self.fa.ask_delete()
 
+    def on_show(self) -> None:
+        TodayPanel.tip_index += 1
+        self.refresh_view()
+
     def refresh_view(self) -> None:
-        a = self.fa
-        self.query_one("#home-picker", HandsPicker).set(a.enrolled, a.sel_finger)
-        self.query_one("#home-sel", Static).update(selection_line(a.sel_finger, a.enrolled))
-        self.query_one("#home-device", Static).update(Text("\n").join(self._device_lines(a.status)))
-        self.query_one("#home-attempts", Static).update(Text("\n").join(self._attempt_lines(a.attempts)))
-
-    def _device_lines(self, s: Status | None) -> list[Text]:
-        if s is None:
-            return [Text("looking...", style=DIM)]
-        if s.error:
-            return [Text(s.error, style=RED)]
-        lib = s.libfprint_version or "not installed"
-        driver = Text(no_wrap=True)
-        if s.patched:
-            driver.append("✔ ", f"bold {GREEN}")
-            driver.append(lib.replace("1:1.94.10+", ""), FG)
-            driver.append("  held" if s.held else "  NOT held", GREEN if s.held else f"bold {RED}")
-        else:
-            driver.append("✘ stock library (sensor not supported)", f"bold {RED}")
-        pam = Text(no_wrap=True)
-        if s.pam_enabled:
-            pam.append("✔ ON", f"bold {GREEN}")
-            pam.append(f"  {s.pam_tries} tries, {s.pam_timeout}s", FG)
-        else:
-            pam.append("○ off", DIM)
-            pam.append(f"  ({s.pam_tries} tries, {s.pam_timeout}s)", DIM)
-        a = self.fa
-        lines = [
-            kv("Sensor", yes_no(s.sensor_present, "found", "NOT FOUND")),
-            kv("Driver", driver),
-            kv("Secret key", yes_no(s.psk_present, "installed", "MISSING", "needs admin to check")),
-            kv("Print store", yes_no(s.store_ok, "private", "too open (run recover)")),
-            kv("Sudo/polkit", pam),
-            kv("Saved fingers", f"{len(a.enrolled)} of 10", FG),
-        ]
-        if a.opens:
-            o = a.opens[-1]
-            ok = o.result == "ok"
-            lines.append(kv("Sensor start", Text(f"{'✔' if ok else '✘'} {o.result}, {o.ms} ms",
-                                                 style=GREEN if ok else RED)))
-        return lines
-
-    def _attempt_lines(self, attempts: list[Attempt]) -> list[Text]:
-        if not attempts:
-            return [Text("No tries logged yet. Use the Test page (3) to try a finger.", style=DIM)]
-        last = attempts[-10:][::-1]
-        scale = max(300, max((a.best_score for a in last), default=0) + 20)
-        head = Text(f"{'time':<10}{'what':<9}{'score  (│ = needed)':<{BAR_W + 2}}{'':>4}  result", style=DIM)
-        return [head] + [attempt_line(x, scale) for x in last]
+        for p in self.query(Panel):
+            p.draw()
 
 
 # --------------------------------------------------------------------------
@@ -204,15 +421,82 @@ class RunPage(Page):
         self.stop_worker()
 
 
+LEGEND = [("●", art.GREEN, "press"), ("●", art.ORANGE, "lift"), ("●", art.RED, "try again"),
+          ("●", art.CYAN, "done")]
+
+
+def legend_line() -> Text:
+    t = Text(no_wrap=True)
+    for i, (dot, col, word) in enumerate(LEGEND):
+        if i:
+            t.append("   ")
+        t.append(dot + " ", col)
+        t.append(word, DIM)
+    return t
+
+
+def steps_line(step: int, width: int, labels: list[str]) -> Text:
+    """'1 Pick a finger ─── 2 Touch the sensor ─── 3 Saved' with the current step lit."""
+    t = Text(no_wrap=True)
+    for i, lab in enumerate(labels, 1):
+        if i > 1:
+            t.append("  ───  ", FAINT)
+        if i < step:
+            t.append(f" ✓ {lab} ", GREEN)
+        elif i == step:
+            t.append(f" {i} {lab} ", f"bold {BG} on {BLUE}")
+        else:
+            t.append(f" {i} {lab} ", DIM)
+    return art.centre(t, width)
+
+
 # --------------------------------------------------------------------------
 # 2 Enroll
 # --------------------------------------------------------------------------
+class PreviewPanel(Panel):
+    """Enroll page, step 1: what will happen, with a dim fingerprint."""
+
+    def build(self, w, h):
+        a = self.app
+        stages = getattr(a, "stages_hint", None)
+        many = f"~{stages}" if stages else "10-20"
+        steps = [
+            ("Touch when the print is", "green", GREEN),
+            ("Lift when it turns", "orange", ORANGE),
+            (f"Repeat {many}× until it is", "full", CYAN),
+        ]
+        text: list[Text] = []
+        for i, (main, word, col) in enumerate(steps, 1):
+            t = Text(no_wrap=True)
+            t.append(f" {i} ", f"bold {BG} on {DIM}")
+            t.append(f"  {main} ", FG)
+            t.append(word, f"bold {col}")
+            text.append(t)
+            text.append(Text())
+        text += wrap("Move your finger a little between touches.", w - 2, DIM)
+        room = h - len(text) - 2
+        fp: list[Text] = []
+        if room >= 8:
+            cols, rows = art.print_size(min(w - 4, 60), min(room, 28))
+            fp = [art.centre(ln, w) for ln in art.fingerprint_lines(
+                0.0, art.blend(FG, BG, 0.5), art.blend(FG, BG, 0.78), cols, rows)] + [Text(), Text()]
+        tw = max((t.cell_len for t in text), default=0)
+        pad = " " * max(0, (w - tw) // 2)
+        body = fp + [Text(pad) + t for t in text]
+        top = max(0, (h - len(body)) // 2)
+        return [Text()] * top + body
+
+
 class EnrollPage(RunPage):
     DEFAULT_CSS = """
-    EnrollPage #enr-pick { height: 1fr; align: center middle; }
-    EnrollPage #enr-box { width: 87; height: auto; border: round #4ea1ff; border-title-color: #4ea1ff; padding: 0 1; }
-    EnrollPage #enr-run { height: 1fr; }
+    EnrollPage #enr-steps { height: 1; margin: 0 0 0 0; }
+    EnrollPage #enr-pick { height: 1fr; }
+    EnrollPage #enr-picker { width: 3fr; min-width: 78; }
+    EnrollPage #enr-preview { width: 2fr; min-width: 36; }
+    EnrollPage #enr-run { height: 1fr; border: round #4f8fd6; border-title-color: #4f8fd6;
+                          border-title-style: bold; padding: 0 1; }
     """
+    STEPS = ["Pick a finger", "Touch the sensor", "Saved"]
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -223,42 +507,53 @@ class EnrollPage(RunPage):
         self.outcome = ""           # completed | failed | ...
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="enr-pick"):
-            with Vertical(id="enr-box"):
-                yield Static(id="enr-title")
-                yield HandsPicker(id="enr-picker")
-                yield Static(id="enr-sel")
+        yield Static(id="enr-steps")
+        with Horizontal(id="enr-pick"):
+            yield FingersPanel("Save a fingerprint - which finger?", "start", cta=True, id="enr-picker")
+            yield PreviewPanel("What will happen", art.B_GREEN, id="enr-preview")
         with Vertical(id="enr-run"):
             yield FingerprintView(id="enr-view")
 
     def on_mount(self) -> None:
-        self.query_one("#enr-box").border_title = "Save a fingerprint"
         self._show_mode()
         self.refresh_view()
 
     def _show_mode(self):
         self.query_one("#enr-pick").display = self.mode == "pick"
         self.query_one("#enr-run").display = self.mode != "pick"
+        self._steps()
+
+    def _steps(self):
+        step = 1 if self.mode == "pick" else (3 if self.outcome == "completed" else 2)
+        w = self.size.width or 120
+        self.query_one("#enr-steps", Static).update(steps_line(step, w, self.STEPS))
+        run = self.query_one("#enr-run")
+        if self.mode != "pick":
+            run.border_title = (f"Saved your {pretty(self.finger)}" if self.outcome == "completed"
+                                else f"Saving your {pretty(self.finger)}")
+            colour = art.B_CYAN if self.outcome == "completed" else (RED if self.outcome else art.B_BLUE)
+            run.styles.border = ("round", colour)
+            run.styles.border_title_color = colour
+
+    def on_resize(self, event) -> None:
+        self._steps()
 
     def on_show(self) -> None:
         self.refresh_view()
 
-    def hint(self) -> str:
+    def hint(self) -> Keys:
         if self.mode == "pick":
-            return "←→↑↓ choose finger   Enter start saving it   d delete it   Tab next page   ? help   q quit"
+            return [("←→↑↓", "choose finger"), ("Enter", "start saving it"), ("d", "delete it")] + NAV
         if self.mode == "run":
-            return "Do what the big word says.   Esc = stop"
+            return [("", "Do what the big word says."), ("Esc", "stop")]
         if self.outcome == "completed":
-            return "Enter = save another finger   Esc = back   q quit"
-        return "Enter = try again   Esc = back   q quit"
+            return [("Enter", "save another finger"), ("t", "test it"), ("Esc", "back"), ("q", "quit")]
+        return [("Enter", "try again"), ("Esc", "back"), ("q", "quit")]
 
     def refresh_view(self) -> None:
-        a = self.fa
-        self.query_one("#enr-picker", HandsPicker).set(a.enrolled, a.sel_finger)
-        self.query_one("#enr-sel", Static).update(selection_line(a.sel_finger, a.enrolled))
-        self.query_one("#enr-title", Static).update(Text(
-            "Pick the finger you want to save, then press Enter.\n"
-            "You will touch the sensor several times; the picture fills up as it learns your finger.\n", style=FG))
+        for p in self.query(Panel):
+            p.draw()
+        self._steps()
 
     # ---- keys
     def move(self, dx, dy):
@@ -308,28 +603,30 @@ class EnrollPage(RunPage):
         self.stage = 0
         self.outcome = ""
         self._show_mode()
-        v = self.query_one("#enr-view", FingerprintView)
-        v.fill = 0.0
-        v.set("idle", "WAIT", "Getting ready...", 0.0, title=f"Saving your {pretty(finger)}")
+        v = self._view()
+        v.grow_to(0.0)
+        v.stage, v.stages = 0, 0
+        v.extra = [legend_line()]
+        v.set("idle", "WAIT", "Getting the sensor ready...", 0.0, title="")
         self.fa.update_chrome()
         self._worker = self.fa.run_worker(self._run(finger), group="op", exclusive=True)
 
     def _view(self) -> FingerprintView:
         return self.query_one("#enr-view", FingerprintView)
 
-    def _title(self) -> str:
-        return f"Saving your {pretty(self.finger)}  -  scan {min(self.stage + 1, self.stages)} of {self.stages}" \
-            if self.outcome == "" and self.stage < self.stages else f"Saving your {pretty(self.finger)}"
-
     def _press(self, hint: str = "Press your finger flat on the sensor and hold still.") -> None:
-        self._view().set("press", "PRESS", hint, title=self._title())
+        nxt = "Then lift it when the print turns orange." if self.stage == 0 else \
+            "Shift it a little from last time, so the sensor sees new parts."
+        self._view().set("press", "PRESS", hint, next_hint=nxt)
 
     async def _run(self, finger: str) -> None:
         be = self.fa.backend
         try:
             self.stages = max(1, await be.num_stages())
             self.stage = 0
-            self._view().title = self._title()
+            v = self._view()
+            v.stages, v.stage = self.stages, 0
+            v.redraw()
             async for ev in be.enroll(finger):
                 self._handle(ev)
                 if self.outcome:
@@ -347,8 +644,11 @@ class EnrollPage(RunPage):
         self.mode = "end"
         self.running = False
         self.busy = False
-        fill = 1.0 if outcome == "completed" else self._view().fill
-        self._view().set(state, word, hint, fill, title=f"Saving your {pretty(self.finger)}", sub=sub)
+        v = self._view()
+        if outcome == "completed":
+            v.stage = v.stages
+        v.set(state, word, hint, 1.0 if outcome == "completed" else None, sub=sub)
+        self._steps()
         self.fa.update_chrome()
 
     def _handle(self, ev) -> None:
@@ -358,21 +658,23 @@ class EnrollPage(RunPage):
             self._press()
         elif k == "stage":
             self.stage += 1
-            v.fill = min(1.0, self.stage / self.stages)
-            v.title = self._title()
-            v.set("lift", "LIFT", "Lift your finger off the sensor.", title=self._title())
+            v.stage = self.stage
+            v.set("lift", "LIFT", "Good. Lift your finger off the sensor.",
+                  fill=min(1.0, self.stage / self.stages),
+                  next_hint=f"{self.stages - self.stage} more touch{'es' if self.stages - self.stage != 1 else ''} to go.")
             self._later(1.0, lambda: self._press() if self.mode == "run" else None)
         elif k in ("retry", "short", "not-centered"):
-            msg = {"retry": "That scan was not clear. Keep your finger still.",
-                   "short": "The touch was too short. Hold your finger down a little longer.",
+            msg = {"retry": "That touch was not clear. Press flat and keep still.",
+                   "short": "That touch was too short. Hold your finger down a little longer.",
                    "not-centered": "Put the middle of your fingertip on the sensor."}[k]
-            v.set("retry", "TRY AGAIN", msg, title=self._title())
+            v.set("retry", "TRY AGAIN", msg, next_hint="This one did not count; nothing is lost.")
             self._later(1.5, lambda: self._press("Press your finger flat on the sensor again.") if self.mode == "run" else None)
         elif k == "remove":
-            v.set("lift", "LIFT", "Lift your finger all the way off, then press again.", title=self._title())
+            v.set("lift", "LIFT", "Lift your finger all the way off, then press again.")
             self._later(1.2, lambda: self._press() if self.mode == "run" else None)
         elif k == "completed":
-            self._finish("completed", "DONE", "Saved! This finger is ready. Press Enter to save another, or Esc to go back.", "done")
+            self._finish("completed", "DONE", "Saved! This finger is ready to use.",
+                         "done", sub="Press t to test it, Enter to save another, or Esc to go back.")
             self.fa.say(f"Saved your {pretty(self.finger)}.")
         elif k == "failed":
             self._finish("failed", "FAILED", "Could not save this finger. Press Enter to try again.", "error")
@@ -395,37 +697,79 @@ def _key(a: Attempt | None):
     return None if a is None else (a.time, tuple(sorted(a.fields.items())), a.best_score, a.result)
 
 
+def score_block(a: Attempt, width: int) -> list[Text]:
+    words, kind = plain_result(a.result)
+    colour = KIND_COLOUR[kind]
+    bw = max(16, min(48, width - 10))
+    t = Text(no_wrap=True)
+    t.append_text(art.score_bar(a.best_score if a.scored else None, bw, colour, a.threshold))
+    t.append(f"  {a.best_score}" if a.scored else "", f"bold {colour}")
+    return [t, art.score_axis(bw)]
+
+
 class TestPage(RunPage):
     __test__ = False            # not a pytest class
 
-    DEFAULT_CSS = "TestPage #tst-view { height: 1fr; }"
+    DEFAULT_CSS = """
+    TestPage #tst-box { height: 1fr; border: round #39c5cf; border-title-color: #39c5cf;
+                        border-title-style: bold; padding: 0 1; }
+    TestPage #tst-view { height: 1fr; }
+    """
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.mode = "idle"          # idle | run | end
         self.result = ""
+        self.last: Attempt | None = None
 
     def compose(self) -> ComposeResult:
-        yield FingerprintView(id="tst-view")
+        with Vertical(id="tst-box"):
+            yield FingerprintView(id="tst-view")
 
     def on_mount(self) -> None:
+        self.query_one("#tst-box").border_title = "Test a fingerprint"
+        self._view().show_bar = False
         self._idle()
 
     def _view(self) -> FingerprintView:
         return self.query_one("#tst-view", FingerprintView)
 
+    def _recent(self, after: bool = False) -> list[Text]:
+        atts = self.fa.attempts[-6:][::-1]
+        if not atts:
+            return []
+        out = [Text("Last tries", style=f"bold {DIM}")]
+        for a in atts:
+            words, kind = plain_result(a.result)
+            t = Text(no_wrap=True)
+            t.append(f"{a.time[:5] or '--:--'}  ", FAINT)
+            t.append(f"{a.best_score if a.scored else '':>6}  ", FG)
+            t.append(words, KIND_COLOUR[kind])
+            out.append(t)
+        return out
+
     def _idle(self) -> None:
         self.mode = "idle"
-        self._view().set("idle", "READY", "Press Enter to start. Then touch the sensor with any saved finger.",
-                         0.0, title="Test a fingerprint")
+        v = self._view()
+        saved = [pretty(f).replace(" finger", "") for f in FINGERS if f in self.fa.enrolled]
+        sub = ("Saved: " + ", ".join(saved)) if saved else "No fingers saved yet - press e to save one."
+        v.extra = self._recent()
+        v.set("idle", "READY", "Press Enter, then touch the sensor with any saved finger.",
+              0.0, title="Test a fingerprint", sub=sub)
 
     def on_show(self) -> None:
-        pass
+        if self.mode == "idle":
+            self._idle()
 
-    def hint(self) -> str:
+    def refresh_view(self) -> None:
+        if self.mode == "idle":
+            self._view().extra = self._recent()
+            self._view().redraw()
+
+    def hint(self) -> Keys:
         if self.mode == "run":
-            return "Do what the big word says.   Esc = stop"
-        return "Enter = start the test   Tab next page   ? help   q quit"
+            return [("", "Do what the big word says."), ("Esc", "stop")]
+        return [("Enter", "start the test")] + NAV
 
     def cancel(self):
         if self.mode == "run":
@@ -438,12 +782,14 @@ class TestPage(RunPage):
         if self.mode == "run":
             return
         if not self.fa.enrolled:
-            self._view().set("error", "NO FINGERS", "No fingerprints are saved yet. Go to page 2 (Enroll) first.", 0.0)
+            self._view().set("error", "NO FINGERS", "No fingerprints are saved yet. Press e (Enroll) to save one first.", 0.0)
             return
         self.mode = "run"
         self.busy = True
         self.running = True
-        self._view().set("idle", "WAIT", "Getting ready...", 0.0, title="Testing")
+        v = self._view()
+        v.extra = []
+        v.set("idle", "WAIT", "Getting the sensor ready...", 0.0, title="Testing", sub="")
         self.fa.update_chrome()
         self._worker = self.fa.run_worker(self._run(), group="op", exclusive=True)
 
@@ -452,6 +798,7 @@ class TestPage(RunPage):
             await asyncio.sleep(self.fa.score_poll)
             attempts, _opens = await self.fa.backend.journal()
             if attempts and _key(attempts[-1]) != before:
+                self.fa.attempts = attempts
                 return attempts[-1]
         return None
 
@@ -461,33 +808,45 @@ class TestPage(RunPage):
         before_list, _ = await be.journal()
         before = _key(before_list[-1]) if before_list else None
         final = False
+        press = "Touch the sensor with a saved finger and hold still."
         try:
             async for ev in be.verify():
                 k = ev.kind
                 if k == "started":
-                    v.set("press", "PRESS", "Touch the sensor with a saved finger and hold still.", 0.0, title="Testing")
+                    v.set("press", "PRESS", press, 1.0, title="Testing", sweep=True)
                 elif k == "retry":
-                    v.set("retry", "TRY AGAIN", "The sensor did not get a good read. Press again.", title="Testing")
-                    self._later(1.5, lambda: v.set("press", "PRESS", "Press your finger flat on the sensor again.", title="Testing")
-                                if self.mode == "run" else None)
+                    v.set("retry", "TRY AGAIN", "The sensor did not get a good read. Lift, then press again.",
+                          title="Testing")
+                    self._later(1.5, lambda: v.set("press", "PRESS", "Press your finger flat on the sensor again.",
+                                                   title="Testing") if self.mode == "run" else None)
                 elif k in ("match", "no-match"):
                     final = True
                     self._cancel_timer()
                     self.result = k
                     at = await self._score_after(before)
+                    self.last = at
                     sub = ""
+                    v.extra = []
                     if at is not None:
                         sub = f"Score {at.best_score}  (a match needs {at.threshold} or more)"
+                        v.extra = score_block(at, 60)
+                    recent = self._recent(after=True)
+                    if recent:
+                        v.extra = v.extra + [Text()] + recent
                     if k == "match":
-                        v.set("match", "MATCH", "That finger is recognised. Press Enter to test again.", 1.0, title="Testing", sub=sub)
+                        v.set("match", "MATCH", "That finger is recognised. Press Enter to test again.", 1.0,
+                              title="Result", sub=sub, sweep=True)
                     else:
-                        v.set("nomatch", "NO MATCH", "That finger is not recognised. Press Enter to test again.", 1.0, title="Testing", sub=sub)
+                        v.set("nomatch", "NO MATCH", "That finger is not recognised. Press Enter to test again.",
+                              1.0, title="Result", sub=sub, sweep=True,
+                              next_hint="Wrong finger, or a different part of it? Try the flat middle of the pad.")
                     break
                 elif k in ("disconnected", "error"):
                     final = True
                     self._cancel_timer()
                     word = "NO SENSOR" if k == "disconnected" else "ERROR"
-                    v.set("error", word, (ev.message or "The sensor is not available.")[:100] + "  Press Enter to retry.", 0.0, title="Testing")
+                    v.set("error", word, (ev.message or "The sensor is not available.")[:100] + "  Press Enter to retry.",
+                          0.0, title="Testing")
                     break
         finally:
             self.running = False
@@ -502,10 +861,83 @@ class TestPage(RunPage):
 # --------------------------------------------------------------------------
 # 4 Settings
 # --------------------------------------------------------------------------
+class SettingsForm(Panel):
+    def build(self, w, h):
+        return self.parent_page.form_lines(w, h)
+
+    @property
+    def parent_page(self) -> "SettingsPage":
+        return self.app.query_one("#page4", SettingsPage)
+
+
+class SettingsSide(SettingsForm):
+    def build(self, w, h):
+        return self.parent_page.side_lines(w, h)
+
+
+def sudo_timeline(tries: int, timeout: int, on: bool, width: int) -> list[Text]:
+    """A picture of what sudo does with these settings."""
+    top, bot = Text(no_wrap=True), Text(no_wrap=True)
+
+    def box(label, style, under=""):
+        top.append(f" {label} ", style)
+        bot.append(f"{under:^{len(label) + 2}}", DIM)
+
+    def arrow():
+        top.append(" ─▶ ", FAINT)
+        bot.append("    ")
+
+    box("$ sudo", f"bold {BG} on {FAINT}")
+    if on:
+        for i in range(tries):
+            arrow()
+            box(f"touch {i + 1}" if tries <= 3 else f"{i + 1}", f"bold {BG} on {GREEN}", f"{timeout}s")
+    arrow()
+    box("password", f"bold {BG} on {BLUE}")
+    if top.cell_len > width:
+        top = Text(f"sudo → up to {tries} touches, {timeout} s each → password", style=FG)
+        bot = Text()
+    lines = [top, bot, Text()]
+    if not on:
+        return lines + wrap("Fingerprint is off: sudo asks for your password straight away.", width, DIM)
+    return lines + wrap(f"Each touch waits up to {timeout} s. A match lets you in at once; after {tries} "
+                        f"miss{'es' if tries > 1 else ''} or {tries * timeout} s at most, it asks for your "
+                        "password instead.", width, DIM)
+
+
+def settings_advice(attempts: list[Attempt], width: int, tries: int = 3, timeout: int = 15) -> list[Text]:
+    """Honest hints from today's log: did prompts time out, or need many touches?"""
+    st = summarise(attempts, today())
+    if not st.attempts:
+        return []
+    timed = sum(1 for a in st.attempts if a.result == "retry:error")
+    out = [Text("From your " + ("tries today" if st.scope == "today" else "recent tries"), style=f"bold {FG}"),
+           Text()]
+    t = Text(no_wrap=True)
+    t.append(f"{timed}", f"bold {ORANGE if timed else GREEN}")
+    t.append(" prompt" + ("s" if timed != 1 else "") + " cancelled or timed out", FG)
+    out.append(t)
+    if st.sessions:
+        t = Text(no_wrap=True)
+        t.append(f"{st.first_try} of {st.sessions}", f"bold {FG}")
+        t.append(" matched on the first touch", FG)
+        out.append(t)
+    out.append(Text())
+    if timed >= 2 and timeout < 20:
+        out += wrap("Prompts often time out: a longer wait gives you more time to reach the sensor.", width, DIM)
+    elif st.sessions and st.first_try < st.sessions * 0.6 and tries < 3:
+        out += wrap("Many prompts need more than one touch: 3 or more tries is a good setting.", width, DIM)
+    else:
+        out += wrap("Looks fine: the current values suit how you use it.", width, DIM)
+    return out
+
+
 class SettingsPage(Page):
     DEFAULT_CSS = """
     SettingsPage { align: center top; }
-    SettingsPage #set-box { width: 92; height: auto; border: round #bc8cff; border-title-color: #bc8cff; padding: 1 2; margin-top: 1; }
+    SettingsPage #set-row { height: 1fr; max-width: 170; }
+    SettingsPage #set-form { width: 3fr; min-width: 70; }
+    SettingsPage #set-side { width: 2fr; min-width: 36; }
     """
     ROWS = ["tries", "timeout", "pam", "apply"]
 
@@ -519,15 +951,15 @@ class SettingsPage(Page):
         self.message = ""
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="set-box"):
-            yield Static(id="set-body")
+        with Horizontal(id="set-row"):
+            yield SettingsForm("Settings (for sudo and system password pop-ups)", art.B_PURPLE, id="set-form")
+            yield SettingsSide("What will change", art.B_GOLD, id="set-side")
 
     def on_mount(self) -> None:
-        self.query_one("#set-box").border_title = "Settings (for sudo and system password pop-ups)"
         self.refresh_view()
 
-    def hint(self) -> str:
-        return "↑↓ choose   ←→ change   Enter/a apply   r reload   Tab next page   ? help   q quit"
+    def hint(self) -> Keys:
+        return [("↑↓", "choose"), ("←→", "change"), ("Enter/a", "apply"), ("r", "reload")] + NAV
 
     # ---- current system values (what Apply compares against)
     def load_from_status(self) -> None:
@@ -598,105 +1030,165 @@ class SettingsPage(Page):
 
     def refresh_view(self) -> None:
         self.load_from_status()
-        s = self.fa.status
+        for p in self.query(Panel):
+            p.draw()
+
+    def form_lines(self, w: int, h: int) -> list[Text]:
         t: list[Text] = []
+        s = self.fa.status
+        lw = 36
 
         def row(i, label, value: Text, note: str):
             line = Text(no_wrap=True)
             cur = i == self.row
             line.append("▶ " if cur else "  ", f"bold {BLUE}")
-            line.append(f"{label:<34}", f"bold {FG}" if cur else FG)
+            line.append(f"{label:<{lw}}", f"bold {WHITE}" if cur else FG)
             line.append_text(value)
             line.append(f"   {note}", DIM)
             t.append(line)
 
-        def num(v, lo, hi, unit=""):
+        def num(v, unit=""):
             x = Text(no_wrap=True)
             x.append(" ◀ ", DIM)
             x.append(f"{str(v) + unit:^6}", f"bold {CYAN}")
             x.append(" ▶ ", DIM)
             return x
 
-        t.append(Text("Fingerprint checks happen when sudo or a system pop-up asks for your password.\n"
-                      "Your password always still works. The login screen and lock screen are not affected.\n", style=DIM))
-        row(0, "Fingerprint tries before password", num(self.tries, 1, 5), "(1 - 5)")
-        row(1, "Wait for finger (seconds)", num(self.timeout, 5, 30, " s"), "(5 - 30)")
-        on = Text("  ON  " if self.pam else " OFF  ", style=f"bold {art.BG} on {GREEN}" if self.pam else f"bold {art.BG} on {art.GREY}")
-        row(2, "Use fingerprint for sudo / pop-ups", on, "(Enter or ←→ switches)")
+        t += wrap("Fingerprint checks happen when sudo or a system pop-up asks for your password. "
+                  "Your password always still works. The login screen and lock screen are not affected.", w, DIM)
+        t.append(Text())
+        on = Text("  ON  " if self.pam else " OFF  ",
+                  style=f"bold {BG} on {GREEN}" if self.pam else f"bold {BG} on {art.GREY}")
+        row(0, "Fingerprint tries before password", num(self.tries), "1 - 5")
+        t.append(Text())
+        row(1, "Wait for a finger (seconds)", num(self.timeout, " s"), "5 - 30")
+        t.append(Text())
+        row(2, "Use fingerprint for sudo / pop-ups", on, "Enter or ←→ switches")
         t.append(Text())
         cmds = self.pending_commands()
-        btn = Text(" Apply ", style=f"bold {art.BG} on {BLUE}" if cmds else f"bold {DIM}")
         line = Text(no_wrap=True)
         line.append("▶ " if self.row == 3 else "  ", f"bold {BLUE}")
-        line.append_text(btn)
+        line.append(" Apply ", f"bold {BG} on {BLUE}" if cmds else f"bold {DIM} on {art.TRACK}")
+        line.append("   needs your admin password" if cmds else "   nothing changed yet", DIM)
         t.append(line)
-        t.append(Text())
+        for c in cmds:
+            t.append(Text("    $ " + " ".join(c), style=f"bold {ORANGE}", no_wrap=True))
+        if self.message:
+            t += [Text()] + wrap(self.message, w, f"bold {ORANGE}")
         if s is None or s.error:
-            t.append(Text("Could not read the current settings.", style=RED))
-        elif cmds:
-            t.append(Text("Press Apply to run:", style=DIM))
-            for c in cmds:
-                t.append(Text("  " + " ".join(c), style=f"bold {ORANGE}"))
+            t += [Text(), Text("Could not read the current settings.", style=RED)]
+        t += [Text(), Text("What happens when you type sudo", style=f"bold {FG}"), Text()]
+        t += sudo_timeline(self.tries, self.timeout, self.pam, w)
+        adv = settings_advice(self.fa.attempts, w, self.tries, self.timeout)
+        if adv and len(t) + len(adv) + 2 <= h:
+            t += [Text(), Text()] + adv
+        return t
+
+    def side_lines(self, w: int, h: int) -> list[Text]:
+        s = self.fa.status
+        t: list[Text] = []
+        if s is None or s.error:
+            return [Text("Could not read the current settings.", style=RED)]
+        t.append(Text("Now on this computer", style=f"bold {FG}"))
+        t.append(kv("sudo & pop-ups", "on" if s.pam_enabled else "off", GREEN if s.pam_enabled else DIM))
+        t.append(kv("tries", s.pam_tries))
+        t.append(kv("wait", f"{s.pam_timeout} s"))
+        t.append(Text())
+        cmds = self.pending_commands()
+        if cmds:
+            t.append(Text("Pending", style=f"bold {ORANGE}"))
+            t += wrap("Apply runs the orange command on the left. The screen switches to the normal terminal "
+                      "so sudo can ask for your password, then comes straight back.", w, DIM)
         else:
             t.append(Text("Nothing changed.", style=DIM))
-        if self.message:
             t.append(Text())
-            t.append(Text(self.message, style=f"bold {ORANGE}"))
-        self.query_one("#set-body", Static).update(Text("\n").join(t))
+            t += wrap("Change a value on the left; the exact command that Apply runs appears under the "
+                      "button first.", w, DIM)
+        t.append(Text())
+        t += wrap("Settings are kept in /etc/goodix550c/pam.conf and survive package upgrades.", w, FAINT)
+        return t
 
 
 # --------------------------------------------------------------------------
 # 5 Help
 # --------------------------------------------------------------------------
-HELP_TEXT = """\
- finger - how to use it
+HELP_LEFT = """\
+The big picture
+  The fingerprint shows what the sensor wants:
+    GREEN   PRESS        touch and hold still
+    ORANGE  LIFT         take your finger off
+    RED     TRY AGAIN    did not count, touch again
+    CYAN    DONE/MATCH   all good
+  Do what the big word says; it never asks for two
+  things at once. While saving, the print fills up
+  ridge by ridge, one step per good touch.
 
- The big picture
-   The fingerprint in the middle shows what the sensor is doing:
-     GREEN  PRESS      touch the sensor and hold still
-     ORANGE LIFT       take your finger off
-     RED    TRY AGAIN  that touch was not good enough, touch again
-     CYAN   DONE / MATCH   all good
-   Do exactly what the big word says. It never asks for two things at once.
+Pages (press the number or letter)
+  1      Home       status, fingers, recent tries
+  2  e   Enroll     pick a finger, touch until DONE
+  3  t   Test       touch, see MATCH and the score
+  4  s   Settings   tries and wait time for sudo
+  5  ?   Help       this page
+"""
+HELP_RIGHT = """\
+Keys
+  arrows / h j k l   hands: left/right = next finger,
+                     up/down = same finger, other hand
+  Enter              choose / start
+  Esc                stop what is running, or go back
+  d                  delete the chosen finger (asks)
+  r                  reload        Tab  next page
+  q                  quit
 
- Pages (press the number)
-   1 Home       the sensor and driver at a glance, your saved fingers, and your last 10 tries
-   2 Enroll     choose a finger on the hands, press Enter, then touch the sensor until it says DONE
-   3 Test       press Enter, touch the sensor, and see MATCH or NO MATCH with the score
-   4 Settings   how many tries and how long sudo waits for a finger; turn it on or off
-   5 Help       this page
-
- Keys
-   arrows or h j k l   move (hands: left/right = next finger, up/down = other hand)
-   Enter               choose / start
-   Esc                 stop what is running, or go back
-   d                   delete the chosen finger (asks first)
-   r                   reload from the system
-   Tab                 next page          ?   help          q   quit
-
- Good to know
-   A match needs a score of 150 or more. The Home page shows your recent scores.
-   Settings that change system files ask for your admin password in the normal terminal;
-   the app comes back right after.
-   Nothing here can lock you out: your password always works.
-   Try the app without the sensor:   finger --demo
-
- Press 1 to go back.
+Good to know
+  A match needs a score of 150 or more. Scores use a
+  log scale: 150-300 is a normal match, 1000+ great.
+  System settings ask for your admin password in the
+  normal terminal; the app comes back afterwards.
+  Nothing here can lock you out: your password
+  always works.   Try it without a sensor:
+  finger --demo
 """
 
 
+class HelpPanel(Panel):
+    WORDS = {"GREEN": GREEN, "ORANGE": ORANGE, "RED": RED, "CYAN": CYAN}
+
+    def build(self, w, h):
+        def style(block: str) -> list[Text]:
+            out = []
+            for ln in block.splitlines():
+                if ln and not ln.startswith(" "):
+                    out.append(Text(ln, style=f"bold {CYAN}"))
+                    continue
+                t = Text(ln, style=FG)
+                for word, col in self.WORDS.items():
+                    i = ln.find("    " + word)
+                    if i >= 0:
+                        t.stylize(f"bold {col}", i + 4, i + 4 + 21)
+                out.append(t)
+            return out
+        left, right = style(HELP_LEFT), style(HELP_RIGHT)
+        head = [Text("finger - how to use it", style=f"bold {WHITE}"), Text()]
+        foot = [Text(), Text("Press 1 to go back.", style=DIM)]
+        if w >= 112:
+            body = hcat([head + left + foot, [Text()] * 2 + right], [54, 54], gap=4)
+            bw = 112
+        else:
+            body = head + left + [Text()] + right + foot
+            bw = 54
+        pad = Text(" " * max(0, (w - bw) // 2))
+        lines = [pad + ln for ln in body]
+        top = max(0, (h - len(lines)) // 3)
+        return [Text()] * top + lines
+
+
 class HelpPage(Page):
-    DEFAULT_CSS = """
-    HelpPage #help-box { width: 100; height: auto; border: round #4f8fd6; border-title-color: #4f8fd6; padding: 0 1; }
-    HelpPage { align: center top; }
-    """
-
     def compose(self) -> ComposeResult:
-        with Vertical(id="help-box"):
-            yield Static(HELP_TEXT)
+        yield HelpPanel("Help", art.B_BLUE, id="help-box")
 
-    def on_mount(self) -> None:
-        self.query_one("#help-box").border_title = "Help"
+    def hint(self) -> Keys:
+        return [("1-4", "pages"), ("Tab", "next page"), ("q", "quit")]
 
-    def hint(self) -> str:
-        return "1-4 pages   Tab next page   q quit"
+    def on_show(self) -> None:
+        self.query_one(HelpPanel).draw()

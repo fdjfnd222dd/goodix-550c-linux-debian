@@ -139,6 +139,8 @@ class Attempt:
     result: str = ""
     time: str = ""              # HH:MM:SS when the journal line carried a timestamp
     fields: dict = field(default_factory=dict)
+    date: str = ""              # YYYY-MM-DD when the journal line carried a timestamp
+    session: int = -1           # which sensor session (one sudo prompt / test run); -1 = unknown
 
     @property
     def matched(self) -> bool:
@@ -148,6 +150,11 @@ class Attempt:
     def retry(self) -> bool:
         return self.result.startswith("retry")
 
+    @property
+    def scored(self) -> bool:
+        """The matcher really ran, so best_score means something."""
+        return self.result in ("match", "no-match")
+
 
 @dataclass
 class OpenInfo:
@@ -155,6 +162,38 @@ class OpenInfo:
     ms: int = 0
     phase: str = ""
     time: str = ""
+    date: str = ""
+
+
+# result=... in the driver's attempt line -> (plain English, kind). kind: match | nomatch | retry
+RESULT_TEXT = {
+    "match": ("match", "match"),
+    "no-match": ("no match", "nomatch"),
+    "retry:finger-present": ("finger already on sensor", "retry"),
+    "retry:too-short": ("lifted too fast", "retry"),
+    "retry:remove-finger": ("unclear touch", "retry"),
+    "retry:data-invalid": ("saved print unreadable", "retry"),
+    "retry:error": ("cancelled / timed out", "retry"),
+}
+# a longer explanation, for wide screens
+RESULT_HELP = {
+    "match": "recognised",
+    "no-match": "score below the line: wrong finger, or a different part of it",
+    "retry:finger-present": "lift your finger before the prompt starts, then touch",
+    "retry:too-short": "keep the finger down until it says OK",
+    "retry:remove-finger": "too few ridges seen; press the pad flat",
+    "retry:data-invalid": "delete that finger and save it again",
+    "retry:error": "the prompt was cancelled or nobody touched in time",
+}
+
+
+def plain_result(result: str) -> tuple[str, str]:
+    """Driver result code -> (plain-English words, kind) where kind is match | nomatch | retry."""
+    if result in RESULT_TEXT:
+        return RESULT_TEXT[result]
+    if result.startswith("retry"):
+        return ("had to try again", "retry")
+    return ("unknown", "retry")
 
 
 def _fields(text: str) -> dict:
@@ -162,6 +201,10 @@ def _fields(text: str) -> dict:
 
 
 def parse_journal(text: str) -> tuple[list[Attempt], list[OpenInfo]]:
+    """Attempt and open lines, oldest first. Each attempt gets a `session`: the number of sensor
+    opens before it (fprintd opens the sensor once per sudo prompt / test run). Attempts logged
+    before the first open in the text get -1 (their session started earlier). Without any open
+    lines, attempts more than a minute apart start a new session."""
     attempts: list[Attempt] = []
     opens: list[OpenInfo] = []
     for line in text.splitlines():
@@ -169,18 +212,89 @@ def parse_journal(text: str) -> tuple[list[Attempt], list[OpenInfo]]:
         if not m:
             continue
         t = TIME_RE.match(line)
-        stamp = t.group(2) if t else ""
+        stamp, day = (t.group(2), t.group(1)) if t else ("", "")
         f = _fields(m.group("fields"))
         if m.group("what") == "attempt":
             attempts.append(Attempt(
                 action=str(f.get("action", "")),
                 best_score=int(f.get("best_score", 0) or 0),
                 threshold=int(f.get("threshold", THRESHOLD) or THRESHOLD),
-                result=str(f.get("result", "")), time=stamp, fields=f))
+                result=str(f.get("result", "")), time=stamp, fields=f, date=day,
+                session=len(opens) - 1))
         else:
             opens.append(OpenInfo(str(f.get("result", "")), int(f.get("ms", 0) or 0),
-                                  str(f.get("phase", "")), stamp))
+                                  str(f.get("phase", "")), stamp, day))
+    if not opens:
+        _sessions_by_gap(attempts)
     return attempts, opens
+
+
+def _seconds(a: Attempt) -> int | None:
+    if not a.time:
+        return None
+    h, m, s = (int(x) for x in a.time.split(":"))
+    return h * 3600 + m * 60 + s
+
+
+def _sessions_by_gap(attempts: list[Attempt], gap: int = 60) -> None:
+    sess, prev = -1, None
+    for a in attempts:
+        now = _seconds(a)
+        if now is None or prev is None or now - prev > gap or now < prev:
+            sess += 1
+        a.session = sess
+        prev = now
+
+
+@dataclass
+class Stats:
+    """What the Home page shows as big numbers. Only counts what the journal really says."""
+    scope: str = "today"            # "today" or "recent" (no tries today: everything loaded)
+    tries: int = 0                  # attempt lines
+    matches: int = 0
+    nomatches: int = 0
+    retries: int = 0
+    sessions: int = 0               # sessions whose start we saw
+    first_try: int = 0              # of those, how many matched on the first touch
+    median_score: int | None = None     # over attempts where the matcher ran
+    best_score: int | None = None
+    attempts: list = field(default_factory=list)
+
+    @property
+    def first_try_pct(self) -> int | None:
+        return round(100 * self.first_try / self.sessions) if self.sessions else None
+
+    @property
+    def match_pct(self) -> int | None:
+        n = self.matches + self.nomatches + self.retries
+        return round(100 * self.matches / n) if n else None
+
+
+def summarise(attempts: list[Attempt], today: str = "") -> Stats:
+    """Stats over today's attempts (date == today); with none today, over all of them."""
+    todays = [a for a in attempts if today and a.date == today]
+    scope = "today" if todays else "recent"
+    use = todays or list(attempts)
+    st = Stats(scope=scope, tries=len(use), attempts=use)
+    for a in use:
+        if a.matched:
+            st.matches += 1
+        elif a.result == "no-match":
+            st.nomatches += 1
+        else:
+            st.retries += 1
+    seen: dict[int, Attempt] = {}
+    for a in use:
+        if a.session >= 0 and a.session not in seen:
+            seen[a.session] = a
+    st.sessions = len(seen)
+    st.first_try = sum(1 for a in seen.values() if a.matched)
+    scores = sorted(a.best_score for a in use if a.scored)
+    if scores:
+        mid = len(scores) // 2
+        st.median_score = scores[mid] if len(scores) % 2 else round((scores[mid - 1] + scores[mid]) / 2)
+        st.best_score = scores[-1]
+    return st
 
 
 # ---------------------------------------------------------------------------

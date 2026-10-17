@@ -18,10 +18,10 @@ from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from goodix550c_tui import __version__
-from goodix550c_tui.art import BG, BLUE, DIM, FG, GREEN, ORANGE, RED
+from goodix550c_tui.art import BG, BLUE, DIM, FAINT, FG, GREEN, ORANGE, PANEL, RED
 from goodix550c_tui.pages import EnrollPage, HelpPage, HomePage, SettingsPage, TestPage
 from goodix550c_tui.parsers import FINGERS, Attempt, OpenInfo, Status, pretty
-from goodix550c_tui.widgets import ConfirmScreen
+from goodix550c_tui.widgets import ConfirmScreen, keys_line
 
 PAGE_NAMES = {1: "Home", 2: "Enroll", 3: "Test", 4: "Settings", 5: "Help"}
 REFRESH_SECONDS = 8.0
@@ -38,6 +38,9 @@ class FingerApp(App):
         Binding("3", "page(3)", "Test", show=False),
         Binding("4", "page(4)", "Settings", show=False),
         Binding("5", "page(5)", "Help", show=False),
+        Binding("e", "enroll", "Enroll", show=False),
+        Binding("t", "page(3)", "Test", show=False),
+        Binding("s", "page(4)", "Settings", show=False),
         Binding("left,h", "move(-1,0)", "Left", show=False),
         Binding("right,l", "move(1,0)", "Right", show=False),
         Binding("up,k", "move(0,-1)", "Up", show=False),
@@ -51,7 +54,7 @@ class FingerApp(App):
     ]
     CSS = f"""
     Screen {{ background: {BG}; color: {FG}; }}
-    #tabs {{ height: 1; background: #131820; padding: 0 1; }}
+    #tabs {{ height: 1; background: {PANEL}; padding: 0 1; }}
     #pages {{ height: 1fr; }}
     #msg {{ height: 1; padding: 0 1; }}
     #hint {{ height: 1; padding: 0 1; background: #161b26; color: {DIM}; }}
@@ -77,6 +80,7 @@ class FingerApp(App):
         self.opens: list[OpenInfo] = []
         self._msg_timer = None
         self._prev_page = 1
+        self.stages_hint: int | None = None     # num-enroll-stages, asked once (read-only D-Bus)
 
     # ---- layout
     def compose(self) -> ComposeResult:
@@ -93,6 +97,7 @@ class FingerApp(App):
     def on_mount(self) -> None:
         self.set_page(1)
         self.run_worker(self.refresh_data(), group="refresh")
+        self.run_worker(self.fetch_stages(), group="stages")
         self.set_interval(REFRESH_SECONDS, self._tick)
 
     # ---- properties
@@ -110,6 +115,14 @@ class FingerApp(App):
         return any(self.query_one(f"#page{i}").busy for i in (2, 3))
 
     # ---- data
+    async def fetch_stages(self) -> None:
+        if self.stages_hint is None:
+            try:
+                self.stages_hint = await self.backend.num_stages()
+            except Exception:
+                self.stages_hint = 0
+            self.query_one("#page2").refresh_view()
+
     async def refresh_data(self) -> None:
         be = self.backend
         status, fingers, (attempts, opens) = await asyncio.gather(
@@ -124,7 +137,7 @@ class FingerApp(App):
             self.run_worker(self.refresh_data(), group="refresh")
 
     def refresh_pages(self) -> None:
-        for i in (1, 2, 4):
+        for i in (1, 2, 3, 4):
             self.query_one(f"#page{i}").refresh_view()
         self.update_chrome()
 
@@ -141,8 +154,32 @@ class FingerApp(App):
             t.append(" ")
         if self.demo:
             t.append("  DEMO - nothing is real", f"bold {ORANGE}")
+        right = self._summary()
+        width = self.size.width - 2
+        if right.cell_len and t.cell_len + right.cell_len + 2 <= width:
+            t.append(" " * (width - t.cell_len - right.cell_len))
+            t.append_text(right)
         self.query_one("#tabs", Static).update(t)
-        self.query_one("#hint", Static).update(Text(self.page_widget().hint(), no_wrap=True))
+        self.query_one("#hint", Static).update(keys_line(self.page_widget().hint()))
+
+    def _summary(self) -> Text:
+        """Right end of the tab bar: the state of things in one glance."""
+        s = self.status
+        t = Text(no_wrap=True)
+        if s is None or s.error:
+            return t
+        ok = s.sensor_present
+        t.append("● " if ok else "✗ ", GREEN if ok else RED)
+        t.append("sensor  " if ok else "no sensor  ", DIM)
+        t.append(f"{len(self.enrolled)}", f"bold {FG}")
+        t.append(" saved  ", DIM)
+        t.append("sudo ", DIM)
+        t.append("on" if s.pam_enabled else "off", f"bold {GREEN}" if s.pam_enabled else FAINT)
+        return t
+
+    def on_resize(self, event) -> None:
+        if self.query("#tabs") and self.query("#hint"):
+            self.update_chrome()
 
     def say(self, text: str, colour: str = GREEN, seconds: float = 6.0) -> None:
         self.query_one("#msg", Static).update(Text(text, style=colour, no_wrap=True))
@@ -185,6 +222,11 @@ class FingerApp(App):
         else:
             self._prev_page = self.page
             self.set_page(5)
+
+    def action_enroll(self) -> None:
+        if self.page == 2:
+            return
+        self.action_page(2)
 
     def go_enroll(self, finger: str) -> None:
         self.sel = FINGERS.index(finger)

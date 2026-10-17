@@ -4,17 +4,55 @@ screenshotted, and tested) without the sensor. It never touches the system.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 from collections.abc import AsyncIterator
 
-from goodix550c_tui.parsers import Attempt, Event, OpenInfo, Status
+from goodix550c_tui.parsers import Event, Status, parse_journal
+
+# (minutes before now, result, score) per line; "open" starts a session (one sudo prompt / test).
+# Scores are typical of this sensor: matches 150-1300 with the odd huge one, misses well below.
+_DEMO_LOG = [
+    (1720, "open", 0), (1720, "match", 233), (1690, "open", 0), (1690, "match", 671),
+    (1655, "open", 0), (1655, "no-match", 64), (1654, "match", 198),
+    (1610, "open", 0), (1610, "match", 302), (1580, "open", 0), (1580, "retry:error", 0),
+    (1560, "open", 0), (1560, "match", 455), (1530, "open", 0), (1530, "match", 2210),
+    (1500, "open", 0), (1499, "match", 412),
+    (1460, "open", 0), (1459, "retry:finger-present", 0), (1459, "match", 288),
+    (300, "open", 0), (299, "match", 345),
+    (262, "open", 0), (262, "retry:error", 0),
+    (240, "open", 0), (240, "match", 1310),
+    (205, "open", 0), (205, "no-match", 97), (204, "match", 288),
+    (180, "open", 0), (180, "match", 176),
+    (151, "open", 0), (151, "no-match", 131), (150, "match", 260),
+    (122, "open", 0), (122, "retry:too-short", 0), (121, "match", 301),
+    (96, "open", 0), (96, "match", 33915),
+    (75, "open", 0), (75, "match", 207),
+    (52, "open", 0), (52, "retry:remove-finger", 0), (51, "match", 523),
+    (31, "open", 0), (31, "match", 243),
+    (12, "open", 0), (12, "match", 389),
+]
 
 
-def _attempts() -> list[Attempt]:
-    rows = [("12:01:14", 345, "match"), ("12:01:52", 0, "retry:error"), ("12:03:09", 288, "match"),
-            ("12:08:40", 97, "no-match"), ("12:08:47", 412, "match"), ("12:15:02", 176, "match"),
-            ("12:15:30", 131, "no-match"), ("12:22:18", 260, "match"), ("12:31:44", 0, "retry:short"),
-            ("12:31:50", 301, "match"), ("12:40:05", 207, "match")]
-    return [Attempt("identify", s, 150, r, t, {}) for t, s, r in rows]
+def _stamp(t: datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _attempt_line(t: datetime, result: str, score: int) -> str:
+    return (f"{_stamp(t)} demo fprintd[812]: goodix550c attempt: action=identify ready_to_down_ms=850 "
+            f"best_score={score} threshold=150 result={result}")
+
+
+def _open_line(t: datetime, ms: int = 533) -> str:
+    return f"{_stamp(t)} demo fprintd[812]: goodix550c open: result=ok ms={ms} phase=done drain_bytes=0 tls_retry=0"
+
+
+def demo_journal(now: datetime | None = None) -> list[str]:
+    now = now or datetime.now()
+    out = []
+    for i, (mins, what, score) in enumerate(_DEMO_LOG):
+        t = now - timedelta(minutes=mins, seconds=(len(_DEMO_LOG) - i))
+        out.append(_open_line(t, 480 + (i * 37) % 120) if what == "open" else _attempt_line(t, what, score))
+    return out
 
 
 class FakeBackend:
@@ -23,7 +61,7 @@ class FakeBackend:
     needs_terminal = False
     demo = True
 
-    def __init__(self, step: float = 0.9, stages: int = 8, enrolled: list[str] | None = None,
+    def __init__(self, step: float = 0.9, stages: int = 17, enrolled: list[str] | None = None,
                  verify_script: list[list[str]] | None = None, user: str = "demo"):
         self.user = user
         self.step = step
@@ -32,26 +70,32 @@ class FakeBackend:
         # each verify run plays one list; cycles
         self.verify_script = verify_script or [["retry", "match"], ["no-match"], ["match"]]
         self._verify_runs = 0
-        self.attempts = _attempts()
+        self.lines = demo_journal()
         self.pam_enabled = True
+        self.held = True
         self.tries = 3
         self.timeout = 15
         self.privileged: list[list[list[str]]] = []     # what the UI asked to run as root
         self.fail_delete = False
         self.enroll_script: list[str] | None = None     # override the event kinds of the next enroll
+        self.match_score = 318
 
     # ---- reads
     async def status(self) -> Status:
         return Status(sensor_present=True, libfprint_version="1:1.94.10+goodix550c4", patched=True,
-                      held=True, apt_pin=True, package_version="1.1.0", dropin_present=True,
+                      held=self.held, apt_pin=True, package_version="1.1.1", dropin_present=True,
                       psk_present=None, store_ok=True, pam_enabled=self.pam_enabled,
                       pam_tries=self.tries, pam_timeout=self.timeout, usb_power="on")
 
     async def list_fingers(self) -> list[str]:
         return list(self.enrolled)
 
+    @property
+    def attempts(self):
+        return parse_journal("\n".join(self.lines))[0]
+
     async def journal(self):
-        return list(self.attempts), [OpenInfo("ok", 533, "done", "12:40:04")]
+        return parse_journal("\n".join(self.lines))
 
     async def num_stages(self) -> int:
         return self.stages
@@ -86,13 +130,16 @@ class FakeBackend:
         script = self.verify_script[self._verify_runs % len(self.verify_script)]
         self._verify_runs += 1
         await asyncio.sleep(self.step / 2)
+        self.lines.append(_open_line(datetime.now()))
         yield Event("started", "Verify started!")
         for kind in script:
             await asyncio.sleep(self.step)
             if kind == "match":
-                self.attempts.append(Attempt("identify", 318, 150, "match", "12:50:00", {}))
+                self.lines.append(_attempt_line(datetime.now(), "match", self.match_score))
             elif kind == "no-match":
-                self.attempts.append(Attempt("identify", 88, 150, "no-match", "12:50:00", {}))
+                self.lines.append(_attempt_line(datetime.now(), "no-match", 88))
+            elif kind == "retry":
+                self.lines.append(_attempt_line(datetime.now(), "retry:too-short", 0))
             yield Event(kind, f"Verify result: verify-{kind}")
 
     async def delete(self, finger: str) -> tuple[bool, str]:
