@@ -20,8 +20,8 @@ Searching for an error? These all land here: `list_devices failed: No devices av
 `Impossible to enroll: GDBus.Error:net.reactivated.Fprint.Error.NoSuchDevice`,
 `USB error on device 27c6:550c: Invalid parameter [-2]`.
 
-This repository is a fork of [the-great-king-bart/goodix-550c-linux-driver](https://github.com/the-great-king-bart/goodix-550c-linux-driver),
-which did the original reverse engineering (Ubuntu TOD module, engineering record below). This fork adds
+This repository is based on [the-great-king-bart/goodix-550c-linux-driver](https://github.com/the-great-king-bart/goodix-550c-linux-driver) (MIT; full history kept),
+which did the original reverse engineering (Ubuntu TOD module, engineering record below). This repository adds
 Debian 13 packaging, driver reliability fixes (patches 0015–0019), the `goodix550c-ctl` tool and the `finger` TUI.
 
 ---
