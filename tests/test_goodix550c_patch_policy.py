@@ -31,6 +31,7 @@ PROTOCOL_PY = ROOT / "src" / "goodix550c" / "protocol.py"
 FINGER_PRESENT_PATCH = PATCH_DIR / "0017-goodix550c-refuse-finger-present-reference.patch"
 NON_CONTACT_GATE_PATCH = PATCH_DIR / "0018-goodix550c-verify-non-contact-gate.patch"
 TOUCH_DIRECTION_PATCH = PATCH_DIR / "0019-goodix550c-count-only-touch-direction-as-finger-down.patch"
+RUNTIME_TUNABLES_PATCH = PATCH_DIR / "0020-goodix550c-runtime-tunables.patch"
 DRIVER_SERIES = PATCH_DIR / "driver-series"
 BUILD_SCRIPT = ROOT / "scripts" / "build_goodix550c_libfprint.sh"
 RUN_SCRIPT = ROOT / "scripts" / "run_goodix550c_open_close.sh"
@@ -379,6 +380,7 @@ def test_driver_patch_series_is_explicit_ordered_and_unique():
         FINGER_PRESENT_PATCH.name,
         NON_CONTACT_GATE_PATCH.name,
         TOUCH_DIRECTION_PATCH.name,
+        RUNTIME_TUNABLES_PATCH.name,
     ]
     assert len(entries) == len(set(entries))
 
@@ -772,7 +774,7 @@ def test_finger_guard_patches_follow_the_open_recovery_patch():
         line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     ]
-    assert entries[-3:-1] == [FINGER_PRESENT_PATCH.name, NON_CONTACT_GATE_PATCH.name]
+    assert entries[-4:-2] == [FINGER_PRESENT_PATCH.name, NON_CONTACT_GATE_PATCH.name]
     assert entries.index(FINGER_PRESENT_PATCH.name) > entries.index(LOG_SUMMARY_PATCH.name)
 
 
@@ -909,12 +911,12 @@ def test_non_contact_gate_precedes_scoring_and_reuses_the_enrollment_limit():
 
 # --- 0019: only the touch direction counts as finger-down -------------------
 
-def test_touch_direction_patch_is_last_in_the_series():
+def test_touch_direction_patch_follows_the_gate_patch_in_the_series():
     entries = [
         line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     ]
-    assert entries[-1] == TOUCH_DIRECTION_PATCH.name
+    assert TOUCH_DIRECTION_PATCH.name in entries
     assert entries.index(TOUCH_DIRECTION_PATCH.name) > entries.index(NON_CONTACT_GATE_PATCH.name)
 
 
@@ -978,6 +980,184 @@ def test_touch_direction_summary_field_is_integer_only():
     # Reset per attempt next to the other summary fields, and no key/frame text.
     assert "self->summary_lift_rebases = 0;" in added
     assert not re.search(r"\bpsk\b|\botp\b", added, re.I)
+
+
+# --- 0020: bounded runtime tunables + attempt timing -----------------------
+
+EXPECTED_TUNABLES = {
+    # name: (constant, min, max)
+    "SETTLE_MS": ("GOODIX_MANUAL_FDT_DOWN_SETTLE_MS", 100, 500),
+    "CONFIRMATIONS": ("GOODIX_MANUAL_FDT_CONFIRMATIONS", 1, 3),
+    "POLL_DELAY_MS": ("GOODIX_MANUAL_FDT_POLL_DELAY_MS", 50, 150),
+    "TOUCH_MIN_NEG": ("GOODIX_FDT_TOUCH_MIN_NEG", 15, 35),
+    "LIFT_MIN_POS": ("GOODIX_FDT_LIFT_MIN_POS", 15, 35),
+    "REF_FINGER_MEAN_MAX": ("GOODIX_REF_FINGER_MEAN_MAX", 2000, 2150),
+    "CLEAR_POLLS": ("GOODIX_CLEAR_CONSECUTIVE_POLLS", 1, 3),
+    "UP_WAIT_MS": ("GOODIX_RESULT_FINGER_UP_WAIT_MS", 500, 1500),
+    "NONCONTACT_X1000": ("GOODIX_VERIFY_NO_CONTACT_X1000", 300, 900),
+    "MIN_KEYPOINTS": ("GOODIX_MIN_CAPTURE_KEYPOINTS", 20, 60),
+    "ENROLL_SAMPLES": ("GOODIX_ENROLL_SAMPLES", "GOODIX_ENROLL_SAMPLES_MIN", "GOODIX_ENROLL_SAMPLES_MAX"),
+}
+
+
+def _tune_table():
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    table = added.split("#define GOODIX_TUNE_TABLE(X)", 1)[1].split("typedef enum", 1)[0]
+    rows = re.findall(r"X \((\w+),\s*(\w+),\s*(\w+),\s*(\w+)\)", table)
+    return table, rows
+
+
+def _series_entries():
+    return [
+        line for line in DRIVER_SERIES.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+
+
+def test_runtime_tunables_patch_is_in_the_series_after_0019():
+    entries = _series_entries()
+    assert entries.count(RUNTIME_TUNABLES_PATCH.name) == 1
+    assert entries.index(RUNTIME_TUNABLES_PATCH.name) > entries.index(TOUCH_DIRECTION_PATCH.name)
+
+
+def test_every_tunable_has_clamps_and_a_default_equal_to_the_old_constant():
+    _, rows = _tune_table()
+    assert {name for name, *_ in rows} == set(EXPECTED_TUNABLES)
+    for name, const, lo, hi in rows:
+        want_const, want_lo, want_hi = EXPECTED_TUNABLES[name]
+        assert const == want_const, name
+        assert (lo, hi) == (str(want_lo), str(want_hi)), name
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    # Moved constants keep their value; the new x1000 form equals 0.90.
+    for macro, value in (
+        ("GOODIX_MANUAL_FDT_POLL_DELAY_MS", 100),
+        ("GOODIX_MANUAL_FDT_CONFIRMATIONS", 2),
+        ("GOODIX_MANUAL_FDT_DOWN_SETTLE_MS", 300),
+        ("GOODIX_VERIFY_NO_CONTACT_X1000", 900),
+        ("GOODIX_ENROLL_SAMPLES_MIN", 16),
+        ("GOODIX_ENROLL_SAMPLES_MAX", 30),
+    ):
+        assert int(_define(added, macro)) == value, macro
+    # Compile-time check keeps every default inside its clamp (16 is the floor).
+    assert "G_STATIC_ASSERT" in added
+
+
+def test_safety_knobs_only_move_in_the_stricter_direction():
+    _, rows = _tune_table()
+    by = {name: (lo, hi) for name, _, lo, hi in rows}
+    # Defaults today: keypoints 20, non-contact 900, ref cut 2000, up-wait 1500.
+    assert by["MIN_KEYPOINTS"][0] == "20"           # never below today
+    assert by["NONCONTACT_X1000"][1] == "900"       # never above today's 0.90
+    assert by["REF_FINGER_MEAN_MAX"][0] == "2000"   # never below today
+    assert by["UP_WAIT_MS"][1] == "1500"            # never above today's bound
+    assert by["ENROLL_SAMPLES"][0] == "GOODIX_ENROLL_SAMPLES_MIN"
+
+
+def test_waits_stay_bounded_by_the_clamps():
+    _, rows = _tune_table()
+    numeric = {n: (int(lo), int(hi)) for n, _, lo, hi in rows if lo.isdigit() and hi.isdigit()}
+    assert "CLEAR_WINDOW_MS" not in numeric  # the clear window is not tunable
+    assert numeric["UP_WAIT_MS"][1] <= 1500
+    assert numeric["SETTLE_MS"][1] <= 500
+    assert numeric["CLEAR_POLLS"][1] <= 3 and numeric["CONFIRMATIONS"][1] <= 3
+    assert numeric["POLL_DELAY_MS"][1] <= 150
+    assert all(lo >= 1 for lo, _ in numeric.values())
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    assert "GOODIX_TUNE (self, CLEAR_WINDOW_MS)" not in added
+    assert "GOODIX_TUNE (self, CLEAR_WINDOW_MS)" not in (
+        RUNTIME_TUNABLES_PATCH.read_text(encoding="utf-8"))
+
+
+def test_tunables_never_touch_acceptance_or_safety_constants():
+    table, _ = _tune_table()
+    patch_text = RUNTIME_TUNABLES_PATCH.read_text(encoding="utf-8")
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    assert "GOODIX_SIGFM_BEST_MIN" not in table
+    for forbidden in ("SIGFM", "BEST_MIN", "THRESHOLD", "PSK", "OTP", "DENY",
+                      "FIRMWARE", "SELF_HEAL", "CLEAR_WINDOW"):
+        assert forbidden not in table.upper(), forbidden
+    # The only mention of the threshold is the pre-existing summary field.
+    assert "GOODIX_SIGFM_BEST_MIN" not in added
+    removed = "\n".join(
+        line for line in patch_text.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    )
+    assert "GOODIX_SIGFM_BEST_MIN" not in removed
+    assert "sigfm.cpp" not in patch_text
+    assert "#if 0" not in added
+
+
+def test_tune_helper_is_strict_and_loaded_once_per_open():
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    assert "goodix550c_tune_int (const gchar *name," in added
+    assert '"GOODIX550C_TUNE_"' in added
+    assert "g_ascii_string_to_signed" in added
+    assert "CLAMP (value" in added
+    assert added.count("g_getenv (key)") == 1
+    load = added.split("goodix_tune_load (FpiDeviceGoodix53x5 *self)", 1)[1]
+    assert "goodix550c_tune_int (#name" in load
+    assert "gint       tune[GOODIX_TUNE_COUNT];" in added
+    patch_text = RUNTIME_TUNABLES_PATCH.read_text(encoding="utf-8")
+    launch = patch_text.split("self->log_summary = g_strcmp0", 1)[1][:200]
+    assert "+  goodix_tune_load (self);" in launch
+    # The invalid-value warning names the variable but never echoes its value.
+    warn = added.split("has an invalid value", 1)[0].rsplit("g_warning", 1)[1]
+    assert "text" not in warn
+
+
+def test_enroll_samples_has_one_source_of_truth():
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    assert 'goodix550c_tune_int ("ENROLL_SAMPLES"' in added
+    assert "dev_class->nr_enroll_stages = goodix550c_tune_int" in added
+    assert added.count("fp_device_get_nr_enroll_stages (dev)") >= 4
+    removed = "\n".join(
+        line for line in RUNTIME_TUNABLES_PATCH.read_text(encoding="utf-8").splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    )
+    assert removed.count("GOODIX_ENROLL_SAMPLES") == 5  # class_init plus four enroll.c uses
+
+
+def test_tune_log_line_is_integer_only_and_gated():
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    assert '"goodix550c tune:"' in added
+    assert '" " #name "=%d"' in added
+    body = added.split("goodix_tune_load (FpiDeviceGoodix53x5 *self)", 1)[1].split("goodix_open_ssm_done", 1)[0]
+    assert "if (self->log_summary)" in body
+    assert not re.search(r"\bpsk\b|\botp\b", body, re.I)
+
+
+def test_attempt_summary_gains_timing_and_score_fields():
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    for field in ("down_to_result_ms=%d", "capture_ms=%d", "match_ms=%d",
+                  "templates_scored=%d", "best_idx=%d", "second_best=%d"):
+        assert field in added, field
+    assert added.count("g_get_monotonic_time ()") >= 5
+    for reset in ("summary_capture_start_us = 0", "summary_capture_end_us = 0",
+                  "summary_match_start_us = 0", "summary_match_end_us = 0",
+                  "summary_result_us = 0", "summary_templates_scored = 0",
+                  "summary_best_idx = -1", "summary_second_best = 0"):
+        assert reset in added, reset
+    # Scoring is noted in both the verify and identify loops, log-only.
+    assert added.count("goodix_summary_note_score (self, score, sample_idx);") == 2
+    for call in _log_calls(added):
+        fmt = _format_of(call)
+        for spec in re.findall(r"%[-+ #0]*\d*(?:\.\d+)?[a-zA-Z]", fmt):
+            assert spec in ("%d", "%u", "%s"), (spec, call)
+
+
+def test_tunable_call_sites_replace_the_constants_without_changing_the_gate():
+    added = added_lines(RUNTIME_TUNABLES_PATCH)
+    for use in (
+        "GOODIX_TUNE (self, SETTLE_MS)", "GOODIX_TUNE (self, CONFIRMATIONS)",
+        "GOODIX_TUNE (self, POLL_DELAY_MS)", "GOODIX_TUNE (self, CLEAR_POLLS)",
+        "GOODIX_TUNE (self, UP_WAIT_MS)",
+        "GOODIX_TUNE (self, REF_FINGER_MEAN_MAX)", "GOODIX_TUNE (self, MIN_KEYPOINTS)",
+        "GOODIX_TUNE (self, NONCONTACT_X1000) / 1000.0",
+        "GOODIX_TUNE (self, TOUCH_MIN_NEG)", "GOODIX_TUNE (self, LIFT_MIN_POS)",
+    ):
+        assert use in added, use
+    # Same comparison direction as before (strict >).
+    assert "self->captured_clipped_fraction >\n            GOODIX_TUNE" in added
 
 
 # --- cross-component constants must not drift --------------------------------

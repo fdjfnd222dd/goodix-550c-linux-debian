@@ -4,6 +4,7 @@
 
 #include <gio/gio.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static gboolean
@@ -147,11 +148,58 @@ test_direction_classifier (void)
                  GOODIX_FDT_DIRECTION_AMBIGUOUS, "zero movement classified");
 }
 
+/* Runtime tunables (patch 0020): strict parse, clamp, default on junk. */
+static gboolean
+test_tunables (void)
+{
+  const char *key = "GOODIX550C_TUNE_SETTLE_MS";
+  gboolean ok = TRUE;
+
+  unsetenv (key);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 300, "unset is not the default");
+  setenv (key, "150", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 150, "valid value ignored");
+  setenv (key, "5", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 80, "low value not clamped up");
+  setenv (key, "99999", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 500, "high value not clamped down");
+  setenv (key, "99999999999999", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 300, "int32 overflow accepted");
+  setenv (key, "-7", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 80, "negative not clamped");
+
+  g_test_expect_message (NULL, G_LOG_LEVEL_WARNING, "*invalid value*");
+  setenv (key, "12abc", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 300, "trailing junk accepted");
+  g_test_assert_expected_messages ();
+  g_test_expect_message (NULL, G_LOG_LEVEL_WARNING, "*invalid value*");
+  setenv (key, "", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 300, "empty string accepted");
+  g_test_assert_expected_messages ();
+  g_test_expect_message (NULL, G_LOG_LEVEL_WARNING, "*invalid value*");
+  setenv (key, " 150", 1);
+  ok &= expect (goodix550c_tune_int ("SETTLE_MS", 300, 80, 500) == 300, "leading space accepted");
+  g_test_assert_expected_messages ();
+  unsetenv (key);
+
+  /* Table sanity: every default inside its clamp, and the explicit-threshold
+   * classifier equals the compiled-default one at the defaults. */
+#define CHECK(name, def, lo, hi) \
+  ok &= expect ((lo) <= (def) && (def) <= (hi), #name " default outside clamp");
+  GOODIX_TUNE_TABLE (CHECK)
+#undef CHECK
+  ok &= expect (goodix_device_classify_fdt_direction_with (0, -15, 12, 12) ==
+                GOODIX_FDT_DIRECTION_TOUCH, "lowered touch floor ignored");
+  ok &= expect (goodix_device_classify_fdt_direction_with (0, -15, 30, 30) ==
+                GOODIX_FDT_DIRECTION_AMBIGUOUS, "raised touch floor ignored");
+  return ok;
+}
+
 int
 main (void)
 {
   if (!test_delta_summary () || !test_direction_classifier () ||
-      !test_dual_gate ())
+      !test_dual_gate () || !test_tunables ())
     return 1;
 
   puts ("Goodix manual-FDT offline policy test passed.");

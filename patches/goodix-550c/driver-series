@@ -17,3 +17,4 @@
 0017-goodix550c-refuse-finger-present-reference.patch
 0018-goodix550c-verify-non-contact-gate.patch
 0019-goodix550c-count-only-touch-direction-as-finger-down.patch
+0020-goodix550c-runtime-tunables.patch
