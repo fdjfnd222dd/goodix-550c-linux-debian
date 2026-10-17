@@ -1,5 +1,7 @@
-"""Widgets: the live fingerprint view, the hands picker and the small modal dialogs."""
+"""Widgets: the panel base, the live fingerprint view, the hands picker and the modal dialogs."""
 from __future__ import annotations
+
+import time
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -9,92 +11,247 @@ from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from goodix550c_tui import art
-from goodix550c_tui.art import BG, DIM, FG, GREEN, RED
+from goodix550c_tui.art import BG, DIM, FAINT, FG, GREEN, RED, TRACK, WHITE
 from goodix550c_tui.parsers import pretty
 
 
-class FingerprintView(Static):
-    """Big fingerprint + progress bar + giant status word + one plain-English hint.
+def _cropped(t: Text, width: int) -> Text:
+    t = t.copy()
+    t.truncate(width, overflow="crop")
+    return t
 
-    state: idle | press | lift | retry | nomatch | error | done | match
-    """
+
+class Panel(Static):
+    """A bordered box that redraws its lines to fit its size (like ctop's panels).
+    Subclasses implement build(width, height) -> list[Text]."""
 
     DEFAULT_CSS = """
-    FingerprintView { width: 100%; height: 1fr; content-align: center middle; }
+    Panel { height: 1fr; padding: 0 1; overflow: hidden; border-title-style: bold;
+            border-subtitle-color: #7d8590; }
     """
+
+    def __init__(self, title: str = "", colour: str = art.B_BLUE, **kw):
+        super().__init__(**kw)
+        self.border_title = title
+        self.styles.border = ("round", colour)
+        self.styles.border_title_color = colour
+
+    def build(self, width: int, height: int) -> list[Text]:
+        return []
+
+    def draw(self) -> None:
+        if not self.is_attached:
+            return
+        size = self.content_size
+        if size.width < 4 or size.height < 1:
+            return
+        try:
+            lines = self.build(size.width, size.height)
+        except Exception as e:          # a bad frame must never kill the app
+            lines = [Text(f"draw error: {e!r}", style=RED)]
+        lines = [ln if ln.cell_len <= size.width else _cropped(ln, size.width) for ln in lines[: size.height]]
+        self.update(Text("\n", no_wrap=True).join(lines))
+
+    def on_resize(self, event) -> None:
+        self.draw()
+
+    def on_mount(self) -> None:
+        self.draw()
+
+
+# --------------------------------------------------------------------------
+# The live fingerprint
+# --------------------------------------------------------------------------
+GROW_SECONDS = 0.8          # one passed scan grows the print over this long
+SWEEP_SECONDS = 0.7         # Test page: the result colour sweeps over the whole print
+FRAME = 1 / 24
+
+
+class FingerprintView(Static):
+    """Big fingerprint on the left; on the right the giant status word, one plain-English
+    instruction and progress. Narrow screens stack the two.
+
+    state: idle | press | lift | retry | nomatch | error | done | match
+    `fill` is the target (0..1); `shown` follows it smoothly, ridge by ridge from the core out.
+    """
+
+    DEFAULT_CSS = "FingerprintView { width: 100%; height: 1fr; }"
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.state = "idle"
         self.fill = 0.0
+        self.shown = 0.0
         self.word = "READY"
         self.hint = ""
         self.title = ""
-        self.sub = ""           # extra line under the hint (e.g. the score)
+        self.sub = ""               # extra line under the hint (e.g. the score)
+        self.next_hint = ""         # dim "then ..." line
+        self.stage = 0              # progress pips: stage of stages (stages 0 = no pips)
+        self.stages = 0
+        self.extra: list[Text] = []     # more lines at the bottom of the text column
         self.show_bar = True
-        self._phase = 0
+        self._anim_from = 0.0
+        self._anim_start = 0.0
+        self._anim_len = GROW_SECONDS
+        self._state_t = time.monotonic()
+        self.animate = True
 
+    # ---- driving it
     def on_mount(self) -> None:
-        self.set_interval(0.45, self._flash)
+        self.set_interval(FRAME, self._frame)
         self.redraw()
-
-    def _flash(self) -> None:
-        if self.state in art.FLASHING:
-            self._phase ^= 1
-            self.redraw()
 
     def set(self, state: str, word: str, hint: str = "", fill: float | None = None,
-            title: str | None = None, sub: str = "") -> None:
-        self.state, self.word, self.hint, self.sub = state, word, hint, sub
-        if fill is not None:
-            self.fill = fill
+            title: str | None = None, sub: str = "", sweep: bool = False, next_hint: str = "") -> None:
+        """Change what is shown. A higher `fill` grows smoothly; a lower one jumps.
+        sweep=True replays the fill from empty (the Test page result)."""
+        if state != self.state:
+            self._state_t = time.monotonic()
+        self.state, self.word, self.hint, self.sub, self.next_hint = state, word, hint, sub, next_hint
         if title is not None:
             self.title = title
-        self._phase = 0
+        if fill is not None:
+            self.grow_to(fill, from_zero=sweep)
         self.redraw()
+
+    def grow_to(self, fill: float, from_zero: bool = False) -> None:
+        fill = min(max(fill, 0.0), 1.0)
+        start = 0.0 if from_zero else self.shown
+        if not self.animate or fill <= start:
+            self.fill = self.shown = fill
+            self._anim_start = 0.0
+            return
+        self.fill = fill
+        self._anim_from = start
+        self.shown = start
+        self._anim_start = time.monotonic()
+        self._anim_len = SWEEP_SECONDS if from_zero else GROW_SECONDS
+
+    def settle(self) -> None:
+        """Finish any animation now (tests / screenshots)."""
+        self.shown = self.fill
+        self._anim_start = 0.0
+        self.redraw()
+
+    @property
+    def animating(self) -> bool:
+        return self._anim_start > 0.0
+
+    def _frame(self) -> None:
+        if self.animating:
+            t = (time.monotonic() - self._anim_start) / self._anim_len
+            if t >= 1.0:
+                self.shown = self.fill
+                self._anim_start = 0.0
+            else:
+                e = 1 - (1 - t) ** 3                    # ease out
+                self.shown = self._anim_from + (self.fill - self._anim_from) * e
+            self.redraw()
+        elif self.state in art.FLASHING or self.state in art.PULSING:
+            self.redraw()
 
     def on_resize(self, event) -> None:
         self.redraw()
 
-    def lines(self) -> list[Text]:
-        colour = art.STATE_COLOUR.get(self.state, art.GREY)
+    # ---- colours
+    def colours(self) -> tuple[str, str, str]:
+        """(lit, unlit, word) colours for the current state and moment."""
+        base = art.STATE_COLOUR.get(self.state, FG)
+        age = time.monotonic() - self._state_t
+        if self.state == "idle":
+            return art.blend(FG, BG, 0.35), art.blend(FG, BG, 0.80), art.blend(FG, BG, 0.2)
+        k = 1.0
+        if self.state in art.PULSING:                   # gentle breathing, ~1.6 s
+            import math
+            k = 0.78 + 0.22 * (0.5 + 0.5 * math.cos(age * 2 * math.pi / 1.6))
+        elif self.state in art.FLASHING:                # on/off flash, 0.4 s each
+            k = 1.0 if int(age / 0.4) % 2 == 0 else 0.45
+        lit = art.blend(BG, base, k)
+        unlit = art.blend(art.blend(FG, base, 0.25), BG, 0.74 if k >= 0.9 else 0.80)
+        return lit, unlit, art.blend(BG, base, max(k, 0.55))
+
+    # ---- drawing
+    def pips(self, colour: str, width: int) -> Text:
+        t = Text(no_wrap=True)
+        if self.stages <= 0:
+            return t
+        if self.stages * 2 <= width:
+            for i in range(self.stages):
+                t.append("● " if i < self.stage else "○ ", colour if i < self.stage else FAINT)
+        else:
+            n = max(4, width)
+            on = round(n * self.stage / self.stages)
+            t.append("▰" * on, colour)
+            t.append("▱" * (n - on), TRACK)
+        return t
+
+    def text_column(self, width: int, height: int, word_colour: str, colour: str) -> list[Text]:
         out: list[Text] = []
         if self.title:
-            out.append(Text(self.title, style=f"bold {FG}"))
-        out += art.fingerprint_lines(self.fill, self.state, self._phase)
-        if self.show_bar:
-            n = 24
-            on = round(self.fill * n)
-            bar = Text(no_wrap=True)
-            bar.append("▰" * on, colour if self.state != "idle" else art.GREY)
-            bar.append("▱" * (n - on), art.TRACK)
-            bar.append(f"  {round(self.fill * 100):>3}%", DIM)
-            out.append(bar)
-        height = self.size.height or 99
-        word_colour = colour
-        if self.state in art.FLASHING and self._phase:
-            word_colour = art.blend(colour, BG, 0.55)
-        if height >= len(out) + 5 + 3:
+            out.append(Text(self.title, style=f"bold {FG}", no_wrap=True))
+        if self.stages and self.show_bar:
+            head = Text(no_wrap=True)
+            head.append(f"Scan {min(self.stage, self.stages)} of {self.stages}", DIM)
+            head.append(f"   {round(self.shown * 100):>3}%", f"bold {colour}" if self.state != "idle" else DIM)
+            out.append(head)
+            out.append(self.pips(colour if self.state != "idle" else DIM, width))
+        elif self.show_bar and self.state != "idle":
+            out.append(Text(f"{round(self.shown * 100)}%", style=DIM))
+        out.append(Text())
+        if art.big_word_width(self.word) <= width and height >= len(out) + 5 + 4:
             out += art.big_word(self.word, word_colour)
+        elif art.big_word_width(self.word, half=True) <= width and height >= len(out) + 3 + 3:
+            out += art.big_word(self.word, word_colour, half=True)
         else:
             out.append(Text(self.word, style=f"bold {word_colour}"))
-        out.append(Text(self.hint, style=FG))
+        out.append(Text())
+        out += art.wrap(self.hint, width, f"bold {WHITE}" if self.state != "idle" else FG)
         if self.sub:
-            out.append(Text(self.sub, style=DIM))
+            out += art.wrap(self.sub, width, FG)
+        if self.next_hint:
+            out += art.wrap(self.next_hint, width, DIM)
+        if self.extra and len(out) + 2 <= height:
+            out.append(Text())
+            out += self.extra[: max(0, height - len(out))]
         return out
+
+    def lines(self, width: int, height: int) -> list[Text]:
+        lit, unlit, word_colour = self.colours()
+        colour = art.STATE_COLOUR.get(self.state, FG)
+        edge = WHITE if self.animating else None
+        side = width >= 92
+        if side:
+            cols, rows = art.print_size(max(20, min(84, width - 80)), max(10, height - 2))
+            fp = art.fingerprint_lines(self.shown, lit, unlit, cols, rows, edge=edge, band=0.05)
+            text_w = min(72, width - cols - 10)
+            text = self.text_column(text_w, height, word_colour, colour)
+            left_w = cols + 4
+            fp = [Text()] * max(0, (len(text) - len(fp)) // 2) + fp
+            text = [Text()] * max(0, (len(fp) - len(text)) // 2) + text
+            body = art.hcat([fp, text], [left_w, text_w], gap=4)
+            pad = max(0, (width - left_w - 4 - text_w) // 2)
+            body = [Text(" " * pad) + ln for ln in body]
+        else:
+            text = self.text_column(width - 2, height, word_colour, colour)
+            room = height - len(text) - 1
+            cols, rows = art.print_size(width - 4, min(18, room))
+            fp = art.fingerprint_lines(self.shown, lit, unlit, cols, rows, edge=edge, band=0.05) if room >= 6 else []
+            body = [art.centre(ln, width) for ln in fp] + [Text()] + [art.centre(ln, width) for ln in text]
+        top = max(0, (height - len(body)) // 2)
+        return [Text()] * top + body
 
     def redraw(self) -> None:
         if not self.is_attached:
             return
-        t = Text("\n", justify="center", no_wrap=True).join(self.lines())
-        t.justify = "center"
-        self.update(t)
+        w, h = self.content_size.width or 100, self.content_size.height or 30
+        self.update(Text("\n", no_wrap=True).join(self.lines(w, h)[:h]))
 
 
 class HandsPicker(Static):
     """Both hands, arrow-key selectable (selection lives in `app.sel`)."""
 
-    DEFAULT_CSS = "HandsPicker { width: auto; height: auto; }"
+    DEFAULT_CSS = "HandsPicker { width: 100%; height: auto; }"
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -103,7 +260,14 @@ class HandsPicker(Static):
 
     def set(self, enrolled, selected) -> None:
         self.enrolled, self.selected = set(enrolled), selected
-        self.update(Text("\n").join(art.hands_lines(self.enrolled, self.selected)))
+        self.redraw()
+
+    def redraw(self) -> None:
+        w = self.content_size.width or art.HANDS_W
+        self.update(Text("\n").join(art.centre(ln, w) for ln in art.hands_lines(self.enrolled, self.selected)))
+
+    def on_resize(self, event) -> None:
+        self.redraw()
 
 
 def selection_line(finger: str, enrolled: set[str]) -> Text:
@@ -114,6 +278,17 @@ def selection_line(finger: str, enrolled: set[str]) -> Text:
         t.append("   ● saved", f"bold {GREEN}")
     else:
         t.append("   ○ not saved yet", DIM)
+    return t
+
+
+def keys_line(pairs: list[tuple[str, str]], gap: int = 3) -> Text:
+    """'Enter save it   d delete' with the keys bright and the words dim."""
+    t = Text(no_wrap=True)
+    for i, (k, label) in enumerate(pairs):
+        if i:
+            t.append(" " * gap)
+        t.append(k, f"bold {FG}")
+        t.append(" " + label, DIM)
     return t
 
 
@@ -178,5 +353,3 @@ class ConfirmScreen(ModalScreen):
 
     def action_answer(self, value: bool) -> None:
         self.dismiss(value)
-
-

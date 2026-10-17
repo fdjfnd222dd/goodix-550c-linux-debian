@@ -97,3 +97,52 @@ def test_validate_settings():
     assert p.validate_settings(1, 5) == "" and p.validate_settings(5, 30) == ""
     assert p.validate_settings(0, 15) and p.validate_settings(6, 15)
     assert p.validate_settings(3, 4) and p.validate_settings(3, 31)
+
+
+def test_plain_result_has_no_jargon():
+    assert p.plain_result("match") == ("match", "match")
+    assert p.plain_result("no-match") == ("no match", "nomatch")
+    assert p.plain_result("retry:finger-present") == ("finger already on sensor", "retry")
+    assert p.plain_result("retry:too-short") == ("lifted too fast", "retry")
+    assert p.plain_result("retry:error") == ("cancelled / timed out", "retry")
+    assert p.plain_result("retry:remove-finger")[0] == "unclear touch"
+    assert p.plain_result("retry:data-invalid")[0] == "saved print unreadable"
+    assert p.plain_result("retry:something-new") == ("had to try again", "retry")
+    for code in list(p.RESULT_TEXT) + ["retry:x", ""]:
+        words, kind = p.plain_result(code)
+        assert ":" not in words and "-" not in words.replace(" / ", "") and kind in ("match", "nomatch", "retry")
+    assert set(p.RESULT_HELP) == set(p.RESULT_TEXT)
+
+
+SESSIONS = """\
+2026-10-17T09:00:00+00:00 h fprintd[1]: goodix550c attempt: best_score=300 threshold=150 result=match
+2026-10-17T10:00:00+00:00 h fprintd[1]: goodix550c open: result=ok ms=500 phase=done
+2026-10-17T10:00:05+00:00 h fprintd[1]: goodix550c attempt: best_score=0 threshold=150 result=retry:too-short
+2026-10-17T10:00:09+00:00 h fprintd[1]: goodix550c attempt: best_score=250 threshold=150 result=match
+2026-10-17T11:00:00+00:00 h fprintd[1]: goodix550c open: result=ok ms=510 phase=done
+2026-10-17T11:00:04+00:00 h fprintd[1]: goodix550c attempt: best_score=33915 threshold=150 result=match
+2026-10-17T12:00:00+00:00 h fprintd[1]: goodix550c open: result=ok ms=505 phase=done
+2026-10-17T12:00:03+00:00 h fprintd[1]: goodix550c attempt: best_score=90 threshold=150 result=no-match
+2026-10-16T12:00:03+00:00 h fprintd[1]: goodix550c attempt: best_score=500 threshold=150 result=match
+"""
+
+
+def test_journal_sessions_dates_and_stats():
+    attempts, opens = p.parse_journal(SESSIONS)
+    assert [a.session for a in attempts] == [-1, 0, 0, 1, 2, 2]
+    assert attempts[0].date == "2026-10-17" and opens[0].date == "2026-10-17"
+    st = p.summarise(attempts, "2026-10-17")
+    assert st.scope == "today" and st.tries == 5
+    assert (st.matches, st.nomatches, st.retries) == (3, 1, 1)
+    assert st.sessions == 3 and st.first_try == 1 and st.first_try_pct == 33   # -1 (start unseen) is left out
+    assert st.median_score == 275 and st.best_score == 33915                 # retries carry no score
+    old = p.summarise(attempts, "2030-01-01")
+    assert old.scope == "recent" and old.tries == 6
+    assert p.summarise([], "2026-10-17").first_try_pct is None
+
+
+def test_sessions_by_time_gap_without_open_lines():
+    text = "\n".join(l for l in SESSIONS.splitlines() if "open:" not in l)
+    attempts, opens = p.parse_journal(text)
+    assert opens == []
+    assert [a.session for a in attempts][:4] == [0, 1, 1, 2]

@@ -44,13 +44,46 @@ def test_home_shows_status_hands_and_attempts():
         t = screen_text(app)
         assert "1 Home" in t and "5 Help" in t and "DEMO" in t
         assert "Sensor" in t and "found" in t and "held" in t
-        assert "3 tries, 15s" in t
+        assert "All good" in t and "3 tries · 15 s" in t
         assert "LEFT HAND" in t and "RIGHT HAND" in t
-        assert t.count("●") == 3 and "2 of 10" in t        # two enrolled fingers + the "● saved" legend
         assert "right index finger" in t and "saved" in t
-        assert "match" in t and "(│ = needed)" in t
-        assert t.count("identify") == 10                    # last 10 only
+        assert "Recent tries" in t and "no match" in t and "log scale" in t
+        assert "Today" in t and "1ST TRY" in t and "MEDIAN" in t
         assert "q quit" in t
+    run(sc)
+
+
+def test_home_uses_plain_english_not_driver_codes():
+    async def sc(app, pilot, be):
+        t = screen_text(app)
+        for jargon in ("identify", "retry (", "retry:", "finger-present", "too-short", "remove-finger"):
+            assert jargon not in t, jargon
+        assert "lifted too fast" in t and "cancelled / timed out" in t
+        assert "1st" in t and "2nd" in t                    # which try of that prompt
+    run(sc)
+
+
+def test_home_status_shows_fix_for_a_problem():
+    async def sc(app, pilot, be):
+        be.held = False
+        await app.refresh_data()
+        await pilot.pause(0.05)
+        t = screen_text(app)
+        assert "1 thing to fix" in t and "not held" in t
+        assert "sudo apt-mark hold libfprint-2-2" in t
+    run(sc)
+
+
+def test_letter_keys_jump_to_pages():
+    async def sc(app, pilot, be):
+        await pilot.press("t")
+        assert app.page == 3
+        await pilot.press("s")
+        assert app.page == 4
+        await pilot.press("e")
+        assert app.page == 2
+        await pilot.press("1")
+        assert app.page == 1
     run(sc)
 
 
@@ -140,12 +173,35 @@ def test_enroll_fills_to_100_and_shows_done():
         assert ("press", "PRESS") in seen_states and ("lift", "LIFT") in seen_states
         assert ("retry", "TRY AGAIN") in seen_states        # the demo script includes a retry
         assert seen_states[-1] == ("done", "DONE")
-        assert "100%" in screen_text(app)
+        await until(pilot, lambda: fv.shown == 1.0)         # the fill animation ends full
+        assert not fv.animating and fv.stage == fv.stages == 6
+        await pilot.pause(0.1)
+        assert "100%" in screen_text(app) and "Scan 6 of 6" in screen_text(app)
         assert "right-middle-finger" in be.enrolled
         await until(pilot, lambda: "right-middle-finger" in app.enrolled)
         await pilot.press("enter")                          # save another -> back to the hands
         assert enroll.mode == "pick"
     run(sc, stages=6, step=0.05)
+
+
+def test_enroll_stage_grows_smoothly_not_in_a_jump():
+    async def sc(app, pilot, be):
+        be.enroll_script = ["stage", "wait"]
+        await pilot.press("2", "right", "enter")
+        enroll = app.query_one("#page2")
+        fv = view(app, "#enr-view")
+        await until(pilot, lambda: enroll.stage == 1)
+        assert fv.fill == 0.25                              # the target: 1 of 4
+        assert fv.animating and fv.shown < fv.fill          # still growing towards it
+        samples = []
+        while fv.animating:
+            samples.append(fv.shown)
+            await pilot.pause(0.03)
+        assert fv.shown == 0.25
+        assert len(set(samples)) >= 4                       # several in-between frames
+        assert samples == sorted(samples)
+        await pilot.press("escape")
+    run(sc, step=0.05, stages=4)
 
 
 def test_enroll_progress_is_stage_over_total():
@@ -216,18 +272,23 @@ def test_verify_match_and_no_match_states():
         page = app.query_one("#page3")
         fv = view(app, "#tst-view")
         assert (fv.state, fv.word) == ("idle", "READY")
+        states = []
+        orig = fv.set
+
+        def spy(state, word, *a, **kw):
+            orig(state, word, *a, **kw)
+            states.append((state, word))
+        fv.set = spy
         await pilot.press("enter")
-        states = set()
-        end = time.monotonic() + 8
-        while page.mode != "end" and time.monotonic() < end:
-            states.add((fv.state, fv.word))
-            await pilot.pause(0.005)
         await until(pilot, lambda: page.mode == "end")
         assert ("press", "PRESS") in states and ("retry", "TRY AGAIN") in states
         assert (fv.state, fv.word) == ("match", "MATCH")
+        await until(pilot, lambda: fv.shown == 1.0)        # the result sweep ends full
+        await pilot.pause(0.05)
         assert "Score 318" in screen_text(app) and "150" in screen_text(app)
         await pilot.press("enter")                         # second run: no-match
         await until(pilot, lambda: page.mode == "end" and fv.word == "NO MATCH")
+        await pilot.pause(0.05)
         assert fv.state == "nomatch" and "Score 88" in screen_text(app)
     run(sc, step=0.08)
 
