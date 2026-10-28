@@ -1426,9 +1426,9 @@ and the machine's login depended on files nobody owned: a hand-edited
 `/etc/systemd/system`, a sleep hook, a TLP denylist, an unstick probe in `/opt` and a
 set of scripts in the home directory. The work, in dependency order: a build that is
 versioned and never overwritten, timing-neutral measurement, a PAM profile, the
-stale-TLS open fix, the finger-present capture fixes, and two packages. The plan is
-`PLAN.md`; the measurement protocol and results are `docs/measurements.md`; recovery
-is `docs/RECOVERY.md`.
+stale-TLS open fix, the finger-present capture fixes, and two packages. The
+measurement protocol and results are `docs/measurements.md`; recovery is
+`docs/RECOVERY.md`.
 
 The safety rules did not move. The deny list (`A4`, `E0`, `E2`, `F0`, `F4`) is
 unchanged, volatile operations still need the build flag and the runtime variable,
