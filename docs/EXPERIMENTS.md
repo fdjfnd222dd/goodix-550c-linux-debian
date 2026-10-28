@@ -1,6 +1,6 @@
 # Experiment campaign — making the 550c "very very good"
 
-Goal: maximise **genuine first-try match** and **sudo/lock-screen first-try success**, minimise time-to-result, with **0 impostor accepts** and **0 open failures**, without touching the safety invariants in `CLAUDE.md`.
+Goal: maximise **genuine first-try match** and **sudo/lock-screen first-try success**, minimise time-to-result, with **0 impostor accepts** and **0 open failures**, without touching the driver safety invariants (see DOCUMENTATION.md).
 
 ## Where we are (2026-10-17, `+goodix550c7` + `goodix550c-fingerprint 1.1.4`, natural+fingertip enrollment, 24 samples)
 | Metric | c5 | Now | Target |
